@@ -1,0 +1,13 @@
+# generated local index — rebuilt on first run, contains your conversation text
+index.db
+index.db-wal
+index.db-shm
+
+server.log
+__pycache__/
+*.pyc
+.DS_Store
+
+# local-only
+.omo/
+CLAUDE.md
