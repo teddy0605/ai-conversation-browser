@@ -7,8 +7,8 @@ Supported sources:
 
 | Tool | Storage read | Delete support |
 |---|---|---|
-| Claude Code | `~/.claude/projects`, `~/.claude-j/projects` (JSONL) | ✓ move to Trash |
-| Codex CLI | `~/.codex/sessions` (JSONL) | ✓ move to Trash |
+| Claude Code | `~/.claude/projects`, `~/.claude-j/projects`, `~/.claude-work/projects` (JSONL) | ✓ move to Trash |
+| Codex CLI | `~/.codex/sessions` (JSONL, current and 2025 rollout formats) | ✓ move to Trash |
 | Grok CLI | `~/.grok/sessions` (JSON/JSONL) | ✓ move to Trash |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite) | ✓ via `opencode session delete` |
 | Hermes | `~/.hermes/sessions/*.json` + `~/.hermes/state.db` | ✓ files via Trash, db-only via `hermes sessions delete` |
@@ -34,13 +34,28 @@ it assumes the app is running and just opens the browser — so a shell alias li
 alias convos='python3 /path/to/ai-conversation-browser/app.py'
 ```
 
-works as both "launch" and "bring it up again".
+works as both "launch" and "bring it up again". If an instance is already running,
+the second launch asks it to reindex before opening the browser.
+
+### Menu bar app (macOS)
+
+```bash
+menubar/build.sh   # builds ~/Applications/Convos.app and launches it
+```
+
+A small Swift menu bar app to open, start, stop, restart and reindex the server
+without a terminal. It runs `app.py` from this folder through your login shell and
+appends output to `server.log`. It also detects and stops an instance you started
+from a terminal. Launching the menu bar app starts the server, and quitting it
+stops the server. Re-run `build.sh` if you move the repo.
 
 ## Features
 
 - **Unified list** with tool badge, title, workspace folder, created/updated times, message count
 - **Search**: instant fuzzy matching on titles/folders + SQLite FTS5 full-text search over
-  message content, with highlighted snippets
+  message content and tool-call inputs (commands, paths, queries). All words must match.
+  Close matches rank first, and `"quoted text"` matches the exact phrase. Snippets show
+  each matched word
 - **Filters**: click a tool chip to solo it (⌘-click to multi-toggle), folder dropdown, sorting,
   ★ starred-only toggle
 - **Keyboard navigation**: `j`/`k` or ↑/↓ to move through the list, `Enter` to open
@@ -56,7 +71,8 @@ works as both "launch" and "bring it up again".
 - **Copy to clipboard**: copy the open conversation as Markdown without downloading a file
 - **Reveal in Finder**: jump straight to a conversation's working folder from the transcript view
 - **Transcript view** with its own in-conversation search (`Cmd+F` inside the panel,
-  `Enter`/`⇧Enter` to jump between matches)
+  `Enter`/`⇧Enter` to jump between matches). Tool calls from every source show as
+  collapsed blocks with their input and output
 - **Delete**: two-click confirm. File-based sources move the session file/folder to the
   macOS Trash — recoverable, never a hard delete. OpenCode and Hermes DB-only sessions
   delete via their own CLI (`opencode session delete`, `hermes sessions delete`)
@@ -98,6 +114,9 @@ works as both "launch" and "bring it up again".
   listed separately so nothing is hidden from search.
 - Cursor IDE content search reuses Cursor's own `conversation-search.db` index; transcripts
   are read lazily from `state.vscdb` with range queries (never a full scan of the 2GB db).
+  So Cursor IDE tool calls show in the transcript but are not searchable.
+- Tool outputs are not indexed (too large and noisy). Only tool inputs are searchable.
+- Parser changes need a full reindex (`python3 app.py --full`) to reach old sessions.
 
 ## License
 
