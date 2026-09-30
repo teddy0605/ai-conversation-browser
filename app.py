@@ -42,6 +42,12 @@ BODY_CAP = int(os.environ.get("ACB_BODY_CAP", "2000000"))
 # Background reindex interval while the app is running (minutes, 0 disables).
 AUTO_REINDEX_MIN = float(os.environ.get("ACB_REINDEX_MIN", "5"))
 
+
+def log(msg, err=False):
+    """Print one server log line with a local timestamp."""
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, file=sys.stderr if err else sys.stdout)
+
+
 CLAUDE_ROOTS = [
     os.path.join(HOME, ".claude", "projects"),
     os.path.join(HOME, ".claude-j", "projects"),
@@ -839,8 +845,8 @@ def load_cursor_search_index():
         for cid, title, fbody in rows:
             out[cid] = (title, (fbody or "")[:BODY_CAP])
     except sqlite3.Error as e:
-        print(f"[cursor-ide] conversation-search.db unavailable ({e}); "
-              "content search limited to titles", file=sys.stderr)
+        log(f"[cursor-ide] conversation-search.db unavailable ({e}); "
+            "content search limited to titles", err=True)
     return out
 
 
@@ -1134,7 +1140,7 @@ def init_db():
         )
     except sqlite3.OperationalError:
         HAS_FTS = False
-        print("FTS5 unavailable — falling back to LIKE search", file=sys.stderr)
+        log("FTS5 unavailable — falling back to LIKE search", err=True)
     con.commit()
     con.close()
 
@@ -1185,6 +1191,7 @@ def remove_unit(con, source, unit_key):
 
 def reindex(full=False, only=None):
     with _reindex_lock:
+        started = time.time()
         con = index_con()
         stats = {}
         for source, (list_units, parse_unit) in SOURCES.items():
@@ -1194,7 +1201,7 @@ def reindex(full=False, only=None):
             try:
                 units = list_units()
             except Exception as e:
-                print(f"[{source}] enumeration failed: {e}", file=sys.stderr)
+                log(f"[{source}] enumeration failed: {e}", err=True)
                 stats[source] = {"error": str(e)}
                 continue
             old = dict(
@@ -1211,7 +1218,7 @@ def reindex(full=False, only=None):
                     rec = parse_unit(key, args)
                 except Exception as e:
                     errors += 1
-                    print(f"[{source}] parse failed for {key}: {e}", file=sys.stderr)
+                    log(f"[{source}] parse failed for {key}: {e}", err=True)
                     continue
                 if rec:
                     upsert(con, source, key, wm, rec)
@@ -1228,8 +1235,13 @@ def reindex(full=False, only=None):
                 "errors": errors,
                 "seconds": round(time.time() - t0, 2),
             }
-            print(f"[{source}] {stats[source]}")
         con.close()
+        done = {src: s for src, s in stats.items() if "total" in s}
+        total = lambda k: sum(s[k] for s in done.values())
+        changed = ", ".join(f"{src} {s['updated']}" for src, s in done.items() if s["updated"])
+        log(f"{'Full reindex' if full else 'Reindex'} done in {time.time() - started:.1f} s: "
+            f"{total('updated')} updated{f' ({changed})' if changed else ''}, "
+            f"{total('removed')} removed, {total('errors')} errors, {total('total')} conversations")
         return stats
 
 
@@ -1769,7 +1781,7 @@ def main():
         return
     init_db()
     if not args.no_index:
-        print("Indexing…")
+        log("Indexing…")
         reindex(full=args.full)
     if AUTO_REINDEX_MIN > 0:
         def auto_reindex():
@@ -1778,9 +1790,9 @@ def main():
                 try:
                     reindex()
                 except Exception as e:
-                    print(f"auto-reindex failed: {e}", file=sys.stderr)
+                    log(f"auto-reindex failed: {e}", err=True)
         threading.Thread(target=auto_reindex, daemon=True).start()
-    print(f"Serving {url}  (Ctrl-C to stop)")
+    log(f"Serving {url}  (Ctrl-C to stop)")
     if not args.no_browser:
         threading.Timer(0.5, webbrowser.open, [url]).start()
     try:
