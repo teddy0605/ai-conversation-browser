@@ -114,8 +114,8 @@
   .meta { grid-column: 2; color: var(--dim); font-size: 12px; overflow: hidden;
           text-overflow: ellipsis; white-space: nowrap; }
   .meta .cwd { color: var(--cwd); }
-  .snippet { grid-column: 2; color: var(--dim); font-size: 12px; font-style: italic;
-             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .snippet { grid-column: 2; color: var(--dim); font-size: 12px; font-style: italic; overflow: hidden;
+             display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
   .snippet b { color: var(--accent); font-style: normal; }
   b.tmatch { color: var(--accent); }
   .right { text-align: right; color: var(--dim); font-size: 12px; white-space: nowrap; }
@@ -132,6 +132,16 @@
     width: min(860px, 96vw); height: 100%; background: var(--panel);
     border-left: 1px solid var(--border); display: flex; flex-direction: column;
   }
+  /* split view (wide windows): list on the left, open conversation fills the rest */
+  body.split {
+    --list-w: clamp(440px, 36vw, 680px);
+    display: grid; grid-template-columns: var(--list-w) minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr); height: 100vh; overflow: hidden;
+  }
+  body.split header { grid-area: 1 / 1; }
+  body.split main { grid-area: 2 / 1; max-width: none; margin: 0; overflow-y: auto; }
+  body.split #overlay { left: var(--list-w); background: none; }
+  body.split #panel { width: 100%; }
   #phead { padding: 14px 18px; border-bottom: 1px solid var(--border); }
   #phead .title { font-size: 15px; white-space: normal; }
   #phead .sub { color: var(--dim); font-size: 12px; margin-top: 5px; word-break: break-all; }
@@ -160,13 +170,16 @@
   .msg.user { margin-left: auto; }
   .msg.user .bubble { background: var(--user-bubble); }
   .msg.user .who { text-align: right; }
-  .bubble pre {
+  .bubble pre, .msg.tool pre {
     background: var(--code-bg); border: 1px solid var(--border); border-radius: 7px;
     padding: 9px 11px; overflow-x: auto; font: 12px/1.45 "SF Mono", Menlo, monospace;
     white-space: pre; margin: 6px 0;
   }
-  .bubble code { background: var(--code-bg); border-radius: 4px; padding: 1px 5px;
+  .bubble code, .msg.tool code { background: var(--code-bg); border-radius: 4px; padding: 1px 5px;
                  font: 12px "SF Mono", Menlo, monospace; }
+  .msg.tool summary { cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .msg.tool pre { max-height: 480px; overflow: auto; }
+  .msg.tool pre.out { opacity: .8; }
   .danger { border-color: #7a3438 !important; color: #f0868a; }
   .danger.confirm { background: #5d2427; color: #fff; }
   #loading { color: var(--dim); padding: 30px; text-align: center; }
@@ -184,6 +197,7 @@
       <option value="created_at">Newest created</option>
       <option value="msg_count">Most messages</option>
       <option value="title">Title A–Z</option>
+      <option value="relevance">Best match (search)</option>
     </select>
     <button id="reindexBtn" title="Rescan all sources for new/changed conversations">⟳ Reindex</button>
     <button id="starredBtn" title="Show only starred conversations">⭐ 0</button>
@@ -332,25 +346,28 @@ function render() {
   if (showStarredOnly) rows = rows.filter(c => c.starred);
 
   if (q) {
-    const scored = [];
+    const matched = [];
     for (const c of rows) {
       const ts = queryScore(q, c);
       const m = ftsMatches ? ftsMatches.get(key(c)) : undefined;
       if (ts >= 0 || m) {
-        // title matches first, then content matches by bm25 relevance
-        scored.push([c, (ts >= 0 ? 8000 + ts : 0) + (m ? 4000 - m.rankIdx : 0), m]);
+        c._snippet = m ? m.snippet : undefined;
+        // Best match: title matches first, then content matches by bm25 relevance
+        c._score = (ts >= 0 ? 8000 + ts : 0) + (m ? 4000 - m.rankIdx : 0);
+        matched.push(c);
       }
     }
-    scored.sort((a, b) => b[1] - a[1]);
-    rows = scored.map(([c, , m]) => (c._snippet = m ? m.snippet : undefined, c));
+    rows = matched;
   } else {
     rows.forEach(c => c._snippet = undefined);
-    rows.sort((a, b) => {
-      if (sort === "title") return (a.title || "").localeCompare(b.title || "");
-      if (sort === "msg_count") return (b.msg_count || 0) - (a.msg_count || 0);
-      return (b[sort] || "").localeCompare(a[sort] || "");
-    });
   }
+  rows.sort((a, b) => {
+    if (sort === "relevance" && q) return b._score - a._score;
+    if (sort === "title") return (a.title || "").localeCompare(b.title || "");
+    if (sort === "msg_count") return (b.msg_count || 0) - (a.msg_count || 0);
+    const field = sort === "relevance" ? "updated_at" : sort;
+    return (b[field] || "").localeCompare(a[field] || "");
+  });
 
   $("count").textContent = `${rows.length} / ${all.length}`;
   $("empty").hidden = rows.length > 0;
@@ -515,10 +532,28 @@ function pushRecent(c) {
   localStorage.setItem("acb-recent", JSON.stringify(recents.slice(0, 8)));
 }
 
+// Wide windows show the list and the open conversation side by side. The list
+// then scrolls inside <main> instead of the window, so carry the position over.
+const SPLIT_MIN_WIDTH = 1000;
+function setSplit(on) {
+  if (on === document.body.classList.contains("split")) return;
+  const main = document.querySelector("main");
+  if (on) {
+    const y = window.scrollY;
+    document.body.classList.add("split");
+    main.scrollTop = y;
+  } else {
+    const y = main.scrollTop;
+    document.body.classList.remove("split");
+    window.scrollTo(0, y);
+  }
+}
+
 async function openDetail(c) {
   current = c;
   $("overlay").classList.add("open");
-  document.body.style.overflow = "hidden";
+  if (innerWidth >= SPLIT_MIN_WIDTH) setSplit(true);
+  else document.body.style.overflow = "hidden";
   // carry the list search into the conversation so it jumps straight to the match
   const listQ = $("q").value.trim();
   if (listQ) $("ps").value = listQ.replace(/^"|"$/g, "");
@@ -534,7 +569,13 @@ async function openDetail(c) {
       $("pbody").innerHTML = `<div id="loading">No displayable text messages (tool-only session).</div>`;
       return;
     }
-    $("pbody").innerHTML = data.messages.map(m => `
+    $("pbody").innerHTML = data.messages.map(m => m.role === "tool" ? `
+      <details class="msg tool">
+        <summary class="who">⚙ ${esc(m.name)}${m.ts ? " · " + esc(absTime(m.ts)) : ""}
+          <code>${esc(m.text.split("\n")[0])}</code></summary>
+        <pre>${esc(m.text)}</pre>
+        ${m.output != null ? `<pre class="out">${esc(m.output)}</pre>` : ""}
+      </details>` : `
       <div class="msg ${m.role === "user" ? "user" : ""}">
         <div class="who">${m.role}${m.ts ? " · " + esc(absTime(m.ts)) : ""}</div>
         <div class="bubble">${renderBubbleText(m.text)}</div>
@@ -560,6 +601,7 @@ async function openDetail(c) {
 
 function closeDetail() {
   $("overlay").classList.remove("open");
+  setSplit(false);
   document.body.style.overflow = "";
   current = null;
   currentMsgs = [];
@@ -618,6 +660,8 @@ function psJump(i) {
   if (psIdx >= 0) psMarks[psIdx].classList.remove("cur");
   psIdx = ((i % psMarks.length) + psMarks.length) % psMarks.length;
   psMarks[psIdx].classList.add("cur");
+  const tool = psMarks[psIdx].closest("details");
+  if (tool) tool.open = true;
   psMarks[psIdx].scrollIntoView({ block: "center" });
   $("psCount").textContent = `${psIdx + 1}/${psMarks.length}`;
 }
@@ -659,6 +703,7 @@ function buildMarkdown(c, msgs) {
     "",
   ];
   for (const m of msgs) {
+    if (m.role === "tool") continue;  // export stays text-only
     lines.push(`## ${m.role}${m.ts ? ` — ${absTime(m.ts)}` : ""}`, "", m.text, "");
   }
   return lines.join("\n");
@@ -797,8 +842,14 @@ function renderRecentMenu() {
 async function reindexNow(btn) {
   btn.disabled = true; btn.textContent = "⟳ Reindexing…";
   try {
-    await fetch("/api/reindex", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const response = await fetch("/api/reindex", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || result.ok !== true) {
+      throw new Error(result.error || `Reindex failed (${response.status})`);
+    }
     await loadList();
+  } catch (err) {
+    alert(`Reindex failed: ${err.message}`);
   } finally {
     btn.disabled = false; btn.textContent = "⟳ Reindex";
   }

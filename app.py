@@ -22,6 +22,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,6 +45,7 @@ AUTO_REINDEX_MIN = float(os.environ.get("ACB_REINDEX_MIN", "5"))
 CLAUDE_ROOTS = [
     os.path.join(HOME, ".claude", "projects"),
     os.path.join(HOME, ".claude-j", "projects"),
+    os.path.join(HOME, ".claude-work", "projects"),
 ]
 CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
 CODEX_TITLE_INDEX = os.path.join(HOME, ".codex", "session_index.jsonl")
@@ -169,19 +172,113 @@ def decode_dashed_path(name):
 
 
 class BodyAcc:
-    """Accumulates searchable body text up to BODY_CAP."""
+    """Accumulates searchable body text up to BODY_CAP. Tool inputs go to a
+    separate list: only the search index gets them, conversations.body does not."""
 
     def __init__(self):
         self.parts = []
         self.length = 0
+        self.tools = []
+        self.tools_length = 0
 
     def add(self, text):
         if text and self.length < BODY_CAP:
             self.parts.append(text[: BODY_CAP - self.length])
             self.length += len(text)
 
+    def add_tool(self, text):
+        if text and self.tools_length < BODY_CAP:
+            text = text[:TOOL_INDEX_CAP]
+            self.tools.append(text)
+            self.tools_length += len(text)
+
     def text(self):
         return "\n".join(self.parts)
+
+    def tool_text(self):
+        return "\n".join(self.tools)
+
+
+# ------------------------------------------------------------- tool calls ----
+
+TOOL_TEXT_CAP = 20000  # chars shown per tool input/output in the transcript view
+TOOL_INDEX_CAP = 2000  # chars of each tool input added to the search index
+# argument that best says what a call does, shown first (and in the summary line)
+TOOL_MAIN_ARGS = ("command", "cmd", "query", "pattern", "glob_pattern", "url", "file_path",
+                  "filePath", "path", "targetFile", "target_file", "relativeWorkspacePath",
+                  "target_directory", "uri")
+
+
+def cap_tool_text(text):
+    if len(text) <= TOOL_TEXT_CAP:
+        return text
+    return text[:TOOL_TEXT_CAP] + f"\n… [{len(text) - TOOL_TEXT_CAP} more chars not shown]"
+
+
+def tool_input_text(args):
+    """Tool arguments (a dict or JSON text) as text: the main argument on the
+    first line, then one "key: value" line for each other argument."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            return args
+    if not isinstance(args, dict):
+        return "" if args is None else json.dumps(args, indent=2, ensure_ascii=False)
+    main = next((k for k in TOOL_MAIN_ARGS if isinstance(args.get(k), (str, list)) and args[k]), None)
+    lines = []
+    if main:
+        v = args[main]
+        lines.append(" ".join(map(str, v)) if isinstance(v, list) else v)  # ["bash", "-lc", "..."]
+    for k, v in args.items():
+        if k != main and v not in (None, "", [], {}):
+            lines.append(f"{k}: {v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)}")
+    return "\n".join(lines)
+
+
+def tool_output_text(out):
+    """Tool output as text: plain text, content blocks, or a JSON wrapper such
+    as {"output": ..., "metadata": {"exit_code": N}}."""
+    wrapped = out
+    if isinstance(out, str):
+        try:
+            wrapped = json.loads(out)
+        except ValueError:
+            return out
+    if isinstance(wrapped, list) and blocks_text(wrapped):
+        return blocks_text(wrapped)
+    if isinstance(wrapped, dict):
+        for k in ("output", "contents", "content", "result", "stdout"):
+            if isinstance(wrapped.get(k), str):
+                code = (wrapped.get("metadata") or {}).get("exit_code", wrapped.get("exit_code"))
+                return wrapped[k] + (f"\n[exit code {code}]" if code else "")
+    if isinstance(wrapped, (dict, list)):
+        return json.dumps(wrapped, indent=2, ensure_ascii=False)
+    return "" if out is None else str(out)
+
+
+def tool_entry(name, args, ts=None):
+    """A transcript entry for one tool call. The loader sets "output" later."""
+    return {"role": "tool", "name": name or "tool", "text": cap_tool_text(tool_input_text(args)),
+            "output": None, "ts": ts}
+
+
+def set_tool_output(entry, out):
+    entry["output"] = cap_tool_text(tool_output_text(out))
+
+
+def openai_tool_calls(tool_calls):
+    """(call id, name, arguments) from an OpenAI-style tool_calls list (a list
+    or JSON text). The name and arguments may sit under "function"."""
+    if isinstance(tool_calls, str):
+        try:
+            tool_calls = json.loads(tool_calls)
+        except ValueError:
+            return
+    for c in tool_calls or []:
+        if isinstance(c, dict):
+            fn = c.get("function") if isinstance(c.get("function"), dict) else c
+            yield c.get("id") or c.get("call_id"), fn.get("name"), fn.get("arguments")
 
 
 # ---------------------------------------------------------- source: claude ----
@@ -201,8 +298,9 @@ def list_claude_units():
     return units
 
 
-def iter_claude_messages(path):
-    """Yields (role, text, ts) for displayable user/assistant turns."""
+def load_claude_transcript(path):
+    """User/assistant turns plus tool calls, each with its result attached."""
+    out, calls = [], {}
     with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
             try:
@@ -212,10 +310,20 @@ def iter_claude_messages(path):
             t = obj.get("type")
             if t not in ("user", "assistant") or obj.get("isSidechain"):
                 continue
-            msg = obj.get("message") or {}
-            text = blocks_text(msg.get("content"))
+            ts = norm_iso(obj.get("timestamp"))
+            content = (obj.get("message") or {}).get("content")
+            text = blocks_text(content)
             if text.strip():
-                yield t, text, norm_iso(obj.get("timestamp"))
+                out.append({"role": t, "text": text, "ts": ts})
+            for b in content if isinstance(content, list) else ():
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use":
+                    calls[b.get("id")] = entry = tool_entry(b.get("name"), b.get("input"), ts)
+                    out.append(entry)
+                elif b.get("type") == "tool_result" and b.get("tool_use_id") in calls:
+                    set_tool_output(calls[b["tool_use_id"]], b.get("content"))
+    return out
 
 
 def parse_claude_unit(path, _args):
@@ -239,12 +347,16 @@ def parse_claude_unit(path, _args):
                 first_ts = first_ts or ts
                 last_ts = ts
             if t in ("user", "assistant") and not obj.get("isSidechain"):
-                text = blocks_text((obj.get("message") or {}).get("content"))
+                content = (obj.get("message") or {}).get("content")
+                text = blocks_text(content)
                 if text.strip():
                     count += 1
                     if first_user is None and t == "user" and not text.lstrip().startswith("<"):
                         first_user = text
                     body.add(text)
+                for b in content if isinstance(content, list) else ():
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        body.add_tool(tool_input_text(b.get("input")))
     return {
         "id": sid,
         "title": title or one_line(first_user) or sid,
@@ -256,6 +368,7 @@ def parse_claude_unit(path, _args):
         "origin_path": path,
         "deletable": 1,
         "body": body.text(),
+        "tool_text": body.tool_text(),
     }
 
 
@@ -291,20 +404,52 @@ def list_codex_units():
     return units
 
 
-def iter_codex_messages(path):
+def codex_items(fh):
+    """Yields (type, payload, timestamp) for each rollout line. Rollouts from
+    2025 have no payload wrapper: a first {id, timestamp} line, then bare items."""
+    for line in fh:
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if "payload" in obj:
+            yield obj.get("type"), obj["payload"] or {}, obj.get("timestamp")
+        elif obj.get("type"):
+            yield "response_item", obj, obj.get("timestamp")
+        elif obj.get("id") and obj.get("timestamp"):
+            yield "session_meta", obj, obj.get("timestamp")
+
+
+def codex_tool_input(p):
+    if p.get("type") == "custom_tool_call":  # apply_patch and similar: raw text input
+        return p.get("input") or ""
+    if p.get("type") == "web_search_call":
+        action = p.get("action") or {}
+        return action.get("query") or action.get("url") or ""
+    return p.get("arguments")
+
+
+def load_codex_transcript(path):
+    """User/assistant messages plus tool calls, each with its output attached."""
+    out, calls = [], {}
     with open(path, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            try:
-                obj = json.loads(line)
-            except ValueError:
+        for kind, p, ts in codex_items(fh):
+            if kind != "response_item":
                 continue
-            p = obj.get("payload") or {}
-            if obj.get("type") == "response_item" and p.get("type") == "message":
-                role = p.get("role")
-                if role in ("user", "assistant"):
-                    text = blocks_text(p.get("content"))
-                    if text.strip():
-                        yield role, text, norm_iso(obj.get("timestamp"))
+            t = p.get("type")
+            ts = norm_iso(ts)
+            if t == "message" and p.get("role") in ("user", "assistant"):
+                text = blocks_text(p.get("content"))
+                if text.strip():
+                    out.append({"role": p["role"], "text": text, "ts": ts})
+            elif t in ("function_call", "custom_tool_call", "web_search_call"):
+                entry = tool_entry(p.get("name") or "web_search", codex_tool_input(p), ts)
+                out.append(entry)
+                if p.get("call_id"):
+                    calls[p["call_id"]] = entry
+            elif t in ("function_call_output", "custom_tool_call_output") and p.get("call_id") in calls:
+                set_tool_output(calls[p["call_id"]], p.get("output"))
+    return out
 
 
 def parse_codex_unit(path, _args):
@@ -312,27 +457,27 @@ def parse_codex_unit(path, _args):
     count = 0
     body = BodyAcc()
     with open(path, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            try:
-                obj = json.loads(line)
-            except ValueError:
-                continue
-            if obj.get("timestamp"):
-                last_ts = obj["timestamp"]
-            p = obj.get("payload") or {}
-            if obj.get("type") == "session_meta":
+        for kind, p, ts in codex_items(fh):
+            if ts:
+                last_ts = ts
+            if kind == "session_meta":
                 sid = p.get("id")
                 cwd = p.get("cwd")
-                created = p.get("timestamp") or obj.get("timestamp")
-            elif obj.get("type") == "response_item" and p.get("type") == "message":
+                created = p.get("timestamp") or ts
+            elif kind == "response_item" and p.get("type") == "message":
                 role = p.get("role")
                 if role in ("user", "assistant"):
                     text = blocks_text(p.get("content"))
+                    if cwd is None and text.startswith("<environment_context>"):  # 2025 rollouts
+                        m = re.search(r"Current working directory: (\S+)", text)
+                        cwd = m and m.group(1)
                     if text.strip():
                         count += 1
                         if first_user is None and role == "user" and not text.lstrip().startswith("<"):
                             first_user = text
                         body.add(text)
+            elif kind == "response_item" and p.get("type") in ("function_call", "custom_tool_call", "web_search_call"):
+                body.add_tool(tool_input_text(codex_tool_input(p)))
     # id = filename stem, not session id: resumed sessions produce several
     # rollout files sharing one session id, and each file must stay indexed
     file_id = os.path.splitext(os.path.basename(path))[0]
@@ -347,6 +492,7 @@ def parse_codex_unit(path, _args):
         "origin_path": path,
         "deletable": 1,
         "body": body.text(),
+        "tool_text": body.tool_text(),
     }
 
 
@@ -371,10 +517,12 @@ def list_grok_units():
     return units
 
 
-def iter_grok_messages(sess_dir):
+def load_grok_transcript(sess_dir):
+    """User/assistant messages plus tool calls, each with its result attached."""
     hist = os.path.join(sess_dir, "chat_history.jsonl")
     if not os.path.isfile(hist):
-        return
+        return []
+    out, calls = [], {}
     with open(hist, encoding="utf-8", errors="replace") as fh:
         for line in fh:
             try:
@@ -382,10 +530,17 @@ def iter_grok_messages(sess_dir):
             except ValueError:
                 continue
             role = obj.get("type") or obj.get("role")
+            ts = norm_iso(obj.get("timestamp"))
             if role in ("user", "assistant"):
                 text = blocks_text(obj.get("content"))
                 if text.strip():
-                    yield role, text, norm_iso(obj.get("timestamp"))
+                    out.append({"role": role, "text": text, "ts": ts})
+                for call_id, name, args in openai_tool_calls(obj.get("tool_calls")):
+                    calls[call_id] = entry = tool_entry(name, args, ts)
+                    out.append(entry)
+            elif role in ("tool_result", "tool") and obj.get("tool_call_id") in calls:
+                set_tool_output(calls[obj["tool_call_id"]], obj.get("content"))
+    return out
 
 
 def parse_grok_unit(sess_dir, _args):
@@ -395,10 +550,13 @@ def parse_grok_unit(sess_dir, _args):
     sid = info.get("id") or os.path.basename(sess_dir)
     body = BodyAcc()
     first_user = None
-    for role, text, _ts in iter_grok_messages(sess_dir):
-        if first_user is None and role == "user" and not text.lstrip().startswith("<"):
-            first_user = text
-        body.add(text)
+    for m in load_grok_transcript(sess_dir):
+        if m["role"] == "tool":
+            body.add_tool(m["text"])
+            continue
+        if first_user is None and m["role"] == "user" and not m["text"].lstrip().startswith("<"):
+            first_user = m["text"]
+        body.add(m["text"])
     size = sum(
         f.stat().st_size for f in os.scandir(sess_dir) if f.is_file()
     )
@@ -416,6 +574,7 @@ def parse_grok_unit(sess_dir, _args):
         "origin_path": sess_dir,
         "deletable": 1,
         "body": body.text(),
+        "tool_text": body.tool_text(),
     }
 
 
@@ -461,6 +620,8 @@ def parse_opencode_unit(sid, row):
             body.add(d["text"])
             if body.length >= BODY_CAP:
                 break
+        elif d.get("type") == "tool":
+            body.add_tool(tool_input_text((d.get("state") or {}).get("input")))
     return {
         "id": sid,
         "title": title or one_line(first_text) or sid,
@@ -472,6 +633,7 @@ def parse_opencode_unit(sid, row):
         "origin_path": f"sqlite:{OPENCODE_DB}#{sid}",
         "deletable": 1,
         "body": body.text(),
+        "tool_text": body.tool_text(),
     }
 
 
@@ -486,7 +648,7 @@ def load_opencode_transcript(sid):
         "SELECT message_id, data FROM part WHERE session_id=? ORDER BY rowid",
         (sid,),
     )
-    parts_by_msg = {}
+    parts_by_msg = {}  # message id -> [text or tool entry], in order
     for mid, data in parts:
         try:
             d = as_json(data)
@@ -494,6 +656,12 @@ def load_opencode_transcript(sid):
             continue
         if d.get("type") == "text" and isinstance(d.get("text"), str):
             parts_by_msg.setdefault(mid, []).append(d["text"])
+        elif d.get("type") == "tool":
+            st = d.get("state") or {}
+            entry = tool_entry(d.get("tool"), st.get("input"))
+            if st.get("output") is not None or st.get("error") is not None:
+                set_tool_output(entry, st["output"] if st.get("output") is not None else st["error"])
+            parts_by_msg.setdefault(mid, []).append(entry)
     out = []
     for mid, data in msgs:
         try:
@@ -503,10 +671,20 @@ def load_opencode_transcript(sid):
         role = d.get("role")
         if role not in ("user", "assistant"):
             continue
-        text = "\n".join(parts_by_msg.get(mid, []))
-        if text.strip():
-            ts = ((d.get("time") or {}).get("created"))
-            out.append({"role": role, "text": text, "ts": iso_from_ms(ts)})
+        ts = iso_from_ms((d.get("time") or {}).get("created"))
+        texts = []
+        # text between tool calls becomes its own entry, so the order stays as it ran
+        for part in parts_by_msg.get(mid, []) + [None]:
+            if isinstance(part, str):
+                texts.append(part)
+                continue
+            text = "\n".join(texts)
+            if text.strip():
+                out.append({"role": role, "text": text, "ts": ts})
+            texts = []
+            if part is not None:
+                part["ts"] = ts
+                out.append(part)
     return out
 
 
@@ -559,6 +737,8 @@ def parse_hermes_unit(unit_key, args):
                 if first_user is None and role == "user" and not text.lstrip().startswith("<"):
                     first_user = text
                 body.add(text)
+            for _id, _name, args in openai_tool_calls(m.get("tool_calls")):
+                body.add_tool(tool_input_text(args))
         return {
             "id": str(sid),
             "title": one_line(first_user) or f"Hermes {obj.get('platform') or ''} session".strip(),
@@ -570,22 +750,25 @@ def parse_hermes_unit(unit_key, args):
             "origin_path": path,
             "deletable": 1,
             "body": body.text(),
+            "tool_text": body.tool_text(),
         }
     sid, title, cwd, started, ended, msg_count = args
     body = BodyAcc()
     first_user = None
     rows = ro_query(
         HERMES_DB,
-        "SELECT role, content FROM messages WHERE session_id=? ORDER BY timestamp",
+        "SELECT role, content, tool_calls FROM messages WHERE session_id=? ORDER BY timestamp",
         (sid,),
     )
-    for role, content in rows:
+    for role, content, tool_calls in rows:
         if role in ("user", "assistant"):
             text = blocks_text(content) if not isinstance(content, str) else content
             if text and text.strip():
                 if first_user is None and role == "user":
                     first_user = text
                 body.add(text)
+            for _id, _name, args in openai_tool_calls(tool_calls):
+                body.add_tool(tool_input_text(args))
     return {
         "id": str(sid),
         "title": title or one_line(first_user) or str(sid),
@@ -597,7 +780,25 @@ def parse_hermes_unit(unit_key, args):
         "origin_path": f"sqlite:{HERMES_DB}#{sid}",
         "deletable": 1,
         "body": body.text(),
+        "tool_text": body.tool_text(),
     }
+
+
+def hermes_entries(rows):
+    """rows: (role, content, tool_calls, tool_call_id, ts). Returns messages
+    plus tool calls, each with its result attached."""
+    out, calls = [], {}
+    for role, content, tool_calls, call_id, ts in rows:
+        if role in ("user", "assistant"):
+            text = content if isinstance(content, str) else blocks_text(content)
+            if text and text.strip():
+                out.append({"role": role, "text": text, "ts": ts})
+            for cid, name, args in openai_tool_calls(tool_calls):
+                calls[cid] = entry = tool_entry(name, args, ts)
+                out.append(entry)
+        elif role == "tool" and call_id in calls:
+            set_tool_output(calls[call_id], content)
+    return out
 
 
 def load_hermes_transcript(origin_path):
@@ -605,23 +806,17 @@ def load_hermes_transcript(origin_path):
         sid = origin_path.split("#", 1)[1]
         rows = ro_query(
             HERMES_DB,
-            "SELECT role, content, timestamp FROM messages WHERE session_id=? ORDER BY timestamp",
+            "SELECT role, content, tool_calls, tool_call_id, timestamp FROM messages "
+            "WHERE session_id=? ORDER BY timestamp",
             (sid,),
         )
-        return [
-            {"role": r, "text": c, "ts": iso_from_s(ts)}
-            for r, c, ts in rows
-            if r in ("user", "assistant") and isinstance(c, str) and c.strip()
-        ]
+        return hermes_entries((r, c, tc, cid, iso_from_s(ts)) for r, c, tc, cid, ts in rows)
     with open(origin_path, encoding="utf-8", errors="replace") as fh:
         obj = json.load(fh)
-    out = []
-    for m in obj.get("messages") or []:
-        role = m.get("role")
-        text = blocks_text(m.get("content"))
-        if role in ("user", "assistant") and text.strip():
-            out.append({"role": role, "text": text, "ts": None})
-    return out
+    return hermes_entries(
+        (m.get("role"), m.get("content"), m.get("tool_calls"), m.get("tool_call_id"), None)
+        for m in obj.get("messages") or [] if isinstance(m, dict)
+    )
 
 
 # ------------------------------------------------------ source: cursor-ide ----
@@ -754,16 +949,20 @@ def load_cursor_ide_transcript(cid):
             b = as_json(value)
         except (ValueError, TypeError):
             continue
+        created = b.get("createdAt") or ""
+        ts = norm_iso(created) if isinstance(created, str) else iso_from_ms(created)
         text = b.get("text") or ""
-        if not text.strip():
-            continue  # tool-call / context bubbles
-        role = "user" if b.get("type") == 1 else "assistant"
-        bubbles.append((b.get("createdAt") or "", role, text))
-    bubbles.sort(key=lambda x: x[0])
-    return [
-        {"role": role, "text": text, "ts": norm_iso(ts) if isinstance(ts, str) else iso_from_ms(ts)}
-        for ts, role, text in bubbles
-    ]
+        if text.strip():
+            role = "user" if b.get("type") == 1 else "assistant"
+            bubbles.append((created, {"role": role, "text": text, "ts": ts}))
+        tf = b.get("toolFormerData")
+        if isinstance(tf, dict) and tf.get("name"):
+            entry = tool_entry(tf["name"], tf.get("rawArgs") or tf.get("params"), ts)
+            if tf.get("result") or tf.get("error"):
+                set_tool_output(entry, tf.get("result") or tf.get("error"))
+            bubbles.append((created, entry))
+    bubbles.sort(key=lambda x: x[0])  # stable: a bubble's text stays before its tool call
+    return [entry for _created, entry in bubbles]
 
 
 # ------------------------------------------------------ source: cursor-cli ----
@@ -838,6 +1037,9 @@ def parse_cursor_cli_unit(chat_dir, _args):
             if first_user is None and role == "user" and not text.lstrip().startswith("<"):
                 first_user = text
             body.add(text)
+        for b in obj.get("content") if isinstance(obj.get("content"), list) else ():
+            if isinstance(b, dict) and b.get("type") == "tool-call":
+                body.add_tool(tool_input_text(b.get("args")))
     if cwd is None:
         cwd = cursor_cli_project_cwd(chat_uuid)
     created = meta.get("createdAt")
@@ -852,17 +1054,27 @@ def parse_cursor_cli_unit(chat_dir, _args):
         "origin_path": chat_dir,
         "deletable": 1,
         "body": body.text(),
+        "tool_text": body.tool_text(),
     }
 
 
 def load_cursor_cli_transcript(chat_dir):
+    """User/assistant messages plus tool calls, each with its result attached."""
     db = os.path.join(chat_dir, "store.db")
-    out = []
+    out, calls = [], {}
     for obj in iter_cursor_cli_blobs(db):
         role = obj.get("role")
         text = blocks_text(obj.get("content"))
         if role in ("user", "assistant") and text.strip():
             out.append({"role": role, "text": text, "ts": None})
+        for b in obj.get("content") if isinstance(obj.get("content"), list) else ():
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool-call":
+                calls[b.get("toolCallId")] = entry = tool_entry(b.get("toolName"), b.get("args"))
+                out.append(entry)
+            elif b.get("type") == "tool-result" and b.get("toolCallId") in calls:
+                set_tool_output(calls[b["toolCallId"]], b.get("result"))
     return out
 
 
@@ -947,7 +1159,8 @@ def upsert(con, source, unit_key, watermark, rec):
     if HAS_FTS:
         con.execute(
             "INSERT INTO conversations_fts (source,id,title,cwd,body) VALUES (?,?,?,?,?)",
-            (source, rec["id"], rec["title"] or "", rec["cwd"] or "", rec["body"] or ""),
+            (source, rec["id"], rec["title"] or "", rec["cwd"] or "",
+             "\n".join(filter(None, (rec["body"], rec.get("tool_text"))))),
         )
     con.execute(
         "INSERT OR REPLACE INTO indexed_units (source,unit_key,watermark) VALUES (?,?,?)",
@@ -1025,11 +1238,11 @@ def reindex(full=False, only=None):
 
 def load_transcript(source, origin_path, conv_id):
     if source == "claude-code":
-        return [{"role": r, "text": t, "ts": ts} for r, t, ts in iter_claude_messages(origin_path)]
+        return load_claude_transcript(origin_path)
     if source == "codex":
-        return [{"role": r, "text": t, "ts": ts} for r, t, ts in iter_codex_messages(origin_path)]
+        return load_codex_transcript(origin_path)
     if source == "grok":
-        return [{"role": r, "text": t, "ts": ts} for r, t, ts in iter_grok_messages(origin_path)]
+        return load_grok_transcript(origin_path)
     if source == "opencode":
         return load_opencode_transcript(conv_id)
     if source == "hermes":
@@ -1157,40 +1370,113 @@ LIST_COLS = ("source,id,title,cwd,created_at,updated_at,msg_count,size_bytes,"
              "origin_path,deletable")
 
 
-def fts_match_exprs(q):
-    """Candidate FTS expressions, tried in order until one yields results.
-    Quoted -> exact phrase. Unquoted multi-word -> words near each other first,
-    then the loose all-words-anywhere match as fallback."""
+FTS_COLS = "{title cwd body}"  # not source: "codex" must not match every Codex row
+SNIPPET_SPAN = 160  # chars: query words closer than this share one snippet fragment
+SNIPPET_HITS = 300  # hits per word checked when looking for the closest group
+
+
+def parse_query(q):
+    """Query words, and True when the query is one "quoted phrase"."""
     q = q.strip()
-    tokens = re.findall(r"[\w']+", q)[:8]
+    return re.findall(r"[\w']+", q)[:8], len(q) >= 2 and q.startswith('"') and q.endswith('"')
+
+
+def fts_match_exprs(tokens, phrase):
+    """Returns (match, near) FTS expressions for the query words.
+    match: every word as a prefix, anywhere, so each extra letter or word can
+    only narrow the results. A quoted query is one exact phrase.
+    near: the same words within 15 tokens of each other. It only ranks those
+    hits first. It never changes which conversations match."""
     if not tokens:
-        return []
-    if len(q) >= 2 and q.startswith('"') and q.endswith('"'):
-        return ['"' + " ".join(tokens) + '"']
-    exprs = []
-    if len(tokens) >= 2:
-        exprs.append("NEAR(" + " ".join(f'"{t}"' for t in tokens) + ", 15)")
-    exprs.append(" ".join(f'"{t}"*' for t in tokens))
-    return exprs
+        return None, None
+    if phrase:
+        return f'{FTS_COLS} : "{" ".join(tokens)}"', None
+    words = " ".join(f'"{t}"*' for t in tokens)
+    return f"{FTS_COLS} : ({words})", (f"{FTS_COLS} : NEAR({words}, 15)" if len(tokens) >= 2 else None)
+
+
+def word_hits(body, pattern):
+    """(start, end) of each word that starts with the pattern, like the FTS
+    prefix match. A regex lookbehind for the word start is 200x slower."""
+    out = []
+    for n, m in enumerate(pattern.finditer(body)):
+        s = m.start()
+        if s and body[s - 1].isalnum():
+            continue  # inside a word, e.g. "the" in "other"
+        out.append((s, m.end()))
+        if len(out) >= SNIPPET_HITS or n >= 20 * SNIPPET_HITS:
+            break
+    return out
+
+
+def make_snippet(body, tokens, phrase):
+    """Text around the query words, with matches in ‹ ›. Words close together
+    share one fragment. Words far apart get one fragment each, so the snippet
+    shows every word the conversation matched on."""
+    if phrase:
+        pats = [re.compile(r"[\W_]+".join(map(re.escape, tokens)), re.I)]
+    else:
+        pats = [re.compile(re.escape(t) + r"[^\W_]*", re.I) for t in tokens]
+    hits = sorted((s, e, i) for i, p in enumerate(pats) for s, e in word_hits(body, p))
+    if not hits:
+        return None  # matched on title or folder only
+    # smallest window that holds each query word found in the body
+    want = len({h[2] for h in hits})
+    best, seen, lo = None, {}, 0
+    for hi, (_s, e, w) in enumerate(hits):
+        seen[w] = seen.get(w, 0) + 1
+        while len(seen) == want:
+            if best is None or e - hits[lo][0] < best[0]:
+                best = (e - hits[lo][0], hits[lo][0], e)
+            w_lo = hits[lo][2]
+            seen[w_lo] -= 1
+            if not seen[w_lo]:
+                del seen[w_lo]
+            lo += 1
+    if best[0] <= SNIPPET_SPAN:
+        spans = [best[1:]]
+    else:  # far apart: the first hit of each word
+        first = {}
+        for s, e, w in hits:
+            first.setdefault(w, (s, e))
+        spans = sorted(first.values())
+    pad = max(30, (SNIPPET_SPAN - sum(e - s for s, e in spans)) // (2 * len(spans)))
+    frags = []
+    for s, e in spans:
+        a, b = max(0, s - pad), min(len(body), e + pad)
+        if a:  # start and end on a word boundary
+            a = body.find(" ", a, s) + 1 or a
+        if b < len(body):
+            b = max(body.rfind(" ", e, b), e)
+        frags.append((a, b, " ".join(body[a:b].split())))
+    text = (("… " if frags[0][0] else "") + " … ".join(f[2] for f in frags)
+            + (" …" if frags[-1][1] < len(body) else ""))
+    hl = re.compile(r"(?<![^\W_])(?:" + "|".join(p.pattern for p in pats) + ")", re.I)
+    return hl.sub(lambda m: "‹" + m.group(0) + "›", text)
 
 
 def search_index(q):
     con = index_con()
     out = []
-    if HAS_FTS:
-        for expr in fts_match_exprs(q):
-            try:
-                rows = con.execute(
-                    "SELECT source, id, snippet(conversations_fts, 4, '‹', '›', ' … ', 14) "
-                    "FROM conversations_fts WHERE conversations_fts MATCH ? "
-                    "ORDER BY rank LIMIT 800",
-                    (expr,),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                continue
-            if rows:
-                out = [{"source": r[0], "id": r[1], "snippet": r[2]} for r in rows]
-                break
+    tokens, phrase = parse_query(q)
+    match, near = fts_match_exprs(tokens, phrase)
+    if HAS_FTS and match:
+        try:
+            # no LIMIT: the page sorts matches by date, so it needs all of them
+            rows = con.execute(
+                "SELECT source, id, body FROM conversations_fts WHERE conversations_fts MATCH ? ORDER BY rank",
+                (match,),
+            ).fetchall()
+            if near:
+                close = set(con.execute(
+                    "SELECT source, id FROM conversations_fts WHERE conversations_fts MATCH ?",
+                    (near,),
+                ).fetchall())
+                rows.sort(key=lambda r: (r[0], r[1]) not in close)  # stable: keeps bm25 order
+            out = [{"source": r[0], "id": r[1], "snippet": make_snippet(r[2] or "", tokens, phrase)}
+                   for r in rows]
+        except sqlite3.OperationalError:
+            pass
     if not out:  # LIKE fallback (also covers FTS syntax edge cases)
         like = f"%{q}%"
         rows = con.execute(
@@ -1417,6 +1703,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def cmd_scan(source):
+    source = {"claude": "claude-code"}.get(source, source)
     targets = list(SOURCES) if source == "all" else [source]
     for src in targets:
         if src not in SOURCES:
@@ -1463,7 +1750,20 @@ def main():
         # bind first: if another instance is already serving, just open the browser
         server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     except OSError:
-        print(f"Port {args.port} already in use — opening {url} (app already running?)")
+        # The long-lived instance owns the index. Sync it before opening the page.
+        try:
+            req = urllib.request.Request(
+                url + "/api/reindex", data=b"{}", method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=120) as response:
+                if response.status != 200:
+                    raise urllib.error.HTTPError(
+                        req.full_url, response.status, response.reason, response.headers, None
+                    )
+            print(f"Port {args.port} already in use — existing app synced; opening {url}")
+        except (OSError, urllib.error.URLError, TimeoutError) as e:
+            print(f"Port {args.port} already in use — sync failed ({e}); opening {url}", file=sys.stderr)
         if not args.no_browser:
             webbrowser.open(url)
         return
