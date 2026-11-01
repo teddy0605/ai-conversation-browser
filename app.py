@@ -79,6 +79,9 @@ CURSOR_WORKSPACE_STORAGE = os.path.join(
 )
 CURSOR_CHATS = os.path.join(HOME, ".cursor", "chats")
 CURSOR_PROJECTS = os.path.join(HOME, ".cursor", "projects")
+PI_SESSIONS = os.path.join(
+    os.environ.get("PI_CODING_AGENT_DIR") or os.path.join(HOME, ".pi", "agent"), "sessions"
+)
 
 SOURCE_LABELS = {
     "claude-code": "Claude Code",
@@ -88,6 +91,7 @@ SOURCE_LABELS = {
     "hermes": "Hermes",
     "cursor-ide": "Cursor IDE",
     "cursor-cli": "Cursor CLI",
+    "pi": "Pi",
 }
 
 # --------------------------------------------------------------- helpers ----
@@ -1113,6 +1117,108 @@ def load_cursor_cli_transcript(chat_dir):
     return out
 
 
+# -------------------------------------------------------------- source: pi ----
+
+
+def list_pi_units():
+    units = {}
+    for dirpath, _dirs, files in os.walk(PI_SESSIONS):
+        for name in files:
+            if name.endswith(".jsonl"):
+                path = os.path.join(dirpath, name)
+                units[path] = (file_watermark(path), None)
+    return units
+
+
+def pi_active_branch(path):
+    """The session header, the session name and the entries of the active
+    branch. Entries form a tree through id/parentId; the active branch is the
+    parent chain that ends at the last entry in the file. Version 1 entries
+    have no ids: each one gets a line id and the previous entry as parent."""
+    header, by_id, last, name = {}, {}, None, None
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for n, line in enumerate(fh):
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("type") == "session":
+                header = obj
+                continue
+            if not obj.get("id"):
+                obj = {**obj, "id": f"line:{n}", "parentId": last and last["id"]}
+            by_id[obj["id"]] = last = obj
+            if obj.get("type") == "session_info":
+                name = obj.get("name")  # session-wide: the newest one wins, "" clears it
+    branch = []
+    while last is not None and len(branch) <= len(by_id):  # bound guards a parentId cycle
+        branch.append(last)
+        last = by_id.get(last.get("parentId"))
+    return header, name, branch[::-1]
+
+
+def pi_transcript(branch):
+    """User/assistant messages plus tool calls, each with its result attached."""
+    out, calls = [], {}
+    for e in branch:
+        m = e.get("message")
+        if e.get("type") != "message" or not isinstance(m, dict):
+            continue
+        ts = norm_iso(e.get("timestamp"))
+        role = m.get("role")
+        if role in ("user", "assistant"):
+            text = blocks_text(m.get("content"))
+            if text.strip():
+                out.append({"role": role, "text": text, "ts": ts})
+            for b in m.get("content") if isinstance(m.get("content"), list) else ():
+                if isinstance(b, dict) and b.get("type") == "toolCall":
+                    calls[b.get("id")] = entry = tool_entry(b.get("name"), b.get("arguments"), ts)
+                    out.append(entry)
+        elif role == "toolResult" and m.get("toolCallId") in calls:
+            set_tool_output(calls[m["toolCallId"]], m.get("content"))
+        elif role == "bashExecution":  # a command the user ran with !
+            entry = tool_entry("bash", {"command": m.get("command")}, ts)
+            set_tool_output(entry, {"output": m.get("output") or "", "exit_code": m.get("exitCode")})
+            out.append(entry)
+    return out
+
+
+def load_pi_transcript(path):
+    return pi_transcript(pi_active_branch(path)[2])
+
+
+def parse_pi_unit(path, _args):
+    header, name, branch = pi_active_branch(path)
+    sid = header.get("id") or os.path.splitext(os.path.basename(path))[0]
+    body = BodyAcc()
+    first_user = None
+    count = 0
+    for m in pi_transcript(branch):
+        if m["role"] == "tool":
+            body.add_tool(m["text"])
+            continue
+        count += 1
+        if first_user is None and m["role"] == "user":
+            first_user = m["text"]
+        body.add(m["text"])
+    last_ts = branch[-1].get("timestamp") if branch else None
+    return {
+        "id": sid,
+        "title": name or one_line(first_user) or sid,
+        "cwd": header.get("cwd"),
+        "created_at": norm_iso(header.get("timestamp")),
+        "updated_at": norm_iso(last_ts) or iso_from_s(os.path.getmtime(path)),
+        "msg_count": count,
+        "size_bytes": os.path.getsize(path),
+        "origin_path": path,
+        "deletable": 1,
+        "body": body.text(),
+        "tool_text": body.tool_text(),
+    }
+
+
 # ---------------------------------------------------------------- indexer ----
 
 SOURCES = {
@@ -1123,6 +1229,7 @@ SOURCES = {
     "hermes": (list_hermes_units, parse_hermes_unit),
     "cursor-ide": (list_cursor_ide_units, parse_cursor_ide_unit),
     "cursor-cli": (list_cursor_cli_units, parse_cursor_cli_unit),
+    "pi": (list_pi_units, parse_pi_unit),
 }
 
 HAS_FTS = True
@@ -1307,6 +1414,8 @@ def load_transcript(source, origin_path, conv_id):
         return load_cursor_ide_transcript(conv_id)
     if source == "cursor-cli":
         return load_cursor_cli_transcript(origin_path)
+    if source == "pi":
+        return load_pi_transcript(origin_path)
     raise ValueError(f"unknown source {source}")
 
 

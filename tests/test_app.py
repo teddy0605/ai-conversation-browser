@@ -52,6 +52,7 @@ class Base(unittest.TestCase):
             "HERMES_SESSIONS": os.path.join(self.tmp, "hermes-sessions"),
             "CURSOR_CHATS": os.path.join(self.tmp, "cursor-chats"),
             "GROK_SESSIONS": os.path.join(self.tmp, "grok"),
+            "PI_SESSIONS": os.path.join(self.tmp, "pi-sessions"),
         }.items():
             p = patch.object(app, name, value)
             p.start()
@@ -466,6 +467,120 @@ class CleanWalTest(Base):
                 os.remove(db + suffix)
         self.assertEqual(app.ro_query(db, "SELECT x FROM t"), [(1,)])
         self.assertFalse(os.path.exists(db + "-wal") or os.path.exists(db + "-shm"))
+
+
+# 19. Pi: index the active branch of a session tree, with tool calls
+class PiTest(Base):
+    def write_session(self, entries):
+        d = os.path.join(app.PI_SESSIONS, "--tmp-proj--")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "2026-10-10T08-00-00-000Z_s1.jsonl")
+        header = {"type": "session", "version": 3, "id": "s1",
+                  "timestamp": "2026-10-10T08:00:00.000Z", "cwd": "/tmp/proj"}
+        with open(path, "w") as fh:
+            for e in [header] + entries:
+                fh.write(json.dumps(e) + "\n")
+        return path
+
+    @staticmethod
+    def msg(eid, parent, role, content, minute, **extra):
+        return {"type": "message", "id": eid, "parentId": parent,
+                "timestamp": f"2026-10-10T08:{minute:02d}:00.000Z",
+                "message": {"role": role, "content": content, **extra}}
+
+    def branched_session(self):
+        # u1 -> a1 (tool call) -> r1 -> a2, then the user went back to r1
+        # and asked again: u1 -> a1 -> r1 -> u2 -> a3 is the active branch
+        return self.write_session([
+            {"type": "model_change", "id": "m0", "parentId": None,
+             "timestamp": "2026-10-10T08:00:00.000Z", "provider": "p", "modelId": "x"},
+            self.msg("u1", "m0", "user", [{"type": "text", "text": "rename get_usr"}], 1),
+            self.msg("a1", "u1", "assistant", [
+                {"type": "text", "text": "looking"},
+                {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "ls -la"}},
+            ], 2),
+            self.msg("r1", "a1", "toolResult", [{"type": "text", "text": "main.py"}], 3,
+                     toolCallId="c1", toolName="bash"),
+            self.msg("a2", "r1", "assistant", [{"type": "text", "text": "abandoned answer"}], 4),
+            self.msg("u2", "r1", "user", "try again", 5),
+            self.msg("a3", "u2", "assistant", [
+                {"type": "thinking", "thinking": "hmm"},
+                {"type": "text", "text": "final answer"},
+            ], 6),
+        ])
+
+    def test_parse_follows_active_branch(self):
+        rec = app.parse_pi_unit(self.branched_session(), None)
+        self.assertEqual(rec["id"], "s1")
+        self.assertEqual(rec["title"], "rename get_usr")
+        self.assertEqual(rec["cwd"], "/tmp/proj")
+        self.assertEqual(rec["created_at"], "2026-10-10T08:00:00Z")
+        self.assertEqual(rec["updated_at"], "2026-10-10T08:06:00Z")
+        self.assertEqual(rec["msg_count"], 4)  # u1, a1, u2, a3
+        self.assertIn("final answer", rec["body"])
+        self.assertNotIn("abandoned answer", rec["body"])
+        self.assertNotIn("hmm", rec["body"])
+        self.assertIn("ls -la", rec["tool_text"])
+
+    def test_transcript_attaches_tool_output(self):
+        msgs = app.load_transcript("pi", self.branched_session(), "s1")
+        self.assertEqual([m["role"] for m in msgs],
+                         ["user", "assistant", "tool", "user", "assistant"])
+        self.assertEqual(msgs[2]["name"], "bash")
+        self.assertEqual(msgs[2]["text"], "ls -la")
+        self.assertEqual(msgs[2]["output"], "main.py")
+
+    @staticmethod
+    def info(eid, parent, name, minute):
+        return {"type": "session_info", "id": eid, "parentId": parent,
+                "timestamp": f"2026-10-10T08:{minute:02d}:00.000Z", "name": name}
+
+    def title(self, entries):
+        return app.parse_pi_unit(self.write_session(entries), None)["title"]
+
+    def test_session_name_is_title(self):
+        self.assertEqual(self.title([self.msg("u1", None, "user", "hello", 1),
+                                     self.info("i1", "u1", "My session", 2)]), "My session")
+
+    def test_empty_session_name_clears_title(self):
+        self.assertEqual(self.title([self.msg("u1", None, "user", "hello", 1),
+                                     self.info("i1", "u1", "My session", 2),
+                                     self.info("i2", "i1", "", 3)]), "hello")
+
+    def test_session_name_survives_branch_switch(self):
+        self.assertEqual(self.title([self.msg("u1", None, "user", "hello", 1),
+                                     self.info("i1", "u1", "My session", 2),
+                                     self.msg("u2", "u1", "user", "other branch", 3)]), "My session")
+
+    def test_user_bash_execution(self):
+        path = self.write_session([
+            self.msg("u1", None, "user", "hello", 1),
+            {"type": "message", "id": "b1", "parentId": "u1",
+             "timestamp": "2026-10-10T08:02:00.000Z",
+             "message": {"role": "bashExecution", "command": "echo shell-marker",
+                         "output": "shell-marker", "exitCode": 1}},
+        ])
+        self.assertIn("echo shell-marker", app.parse_pi_unit(path, None)["tool_text"])
+        tool = app.load_transcript("pi", path, "s1")[1]
+        self.assertEqual((tool["name"], tool["text"]), ("bash", "echo shell-marker"))
+        self.assertEqual(tool["output"], "shell-marker\n[exit code 1]")
+
+    def test_version_1_session_without_ids(self):
+        path = self.write_session([
+            {"type": "message", "timestamp": "2026-10-10T08:01:00.000Z",
+             "message": {"role": "user", "content": "legacy prompt"}},
+            {"type": "message", "timestamp": "2026-10-10T08:02:00.000Z",
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "legacy answer"}]}},
+        ])
+        rec = app.parse_pi_unit(path, None)
+        self.assertEqual((rec["title"], rec["msg_count"]), ("legacy prompt", 2))
+        self.assertIn("legacy answer", rec["body"])
+
+    def test_reindex(self):
+        self.branched_session()
+        stats = app.reindex(only="pi")["pi"]
+        self.assertEqual((stats["total"], stats["updated"], stats["errors"]), (1, 1, 0))
+        self.assertEqual(self.records("pi")[0]["title"], "rename get_usr")
 
 
 if __name__ == "__main__":

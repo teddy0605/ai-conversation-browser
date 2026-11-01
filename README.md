@@ -1,151 +1,153 @@
 # AI Conversation Browser
 
-One local web page to browse, search and clean up conversations from **all** the AI coding
-tools on your machine — because you remember *the conversation*, not *which tool* it was in.
+One local page to browse, search and clean up the conversations of every AI coding tool on your Mac.
+You remember the conversation, not which tool it was in.
 
 [![Tests](https://github.com/teddy0605/ai-conversation-browser/actions/workflows/test.yml/badge.svg)](https://github.com/teddy0605/ai-conversation-browser/actions/workflows/test.yml)
 
-![Conversation list with sample data](docs/screenshot.png)
+![An open conversation with tool calls, next to the list](docs/screenshot.png)
 
-Supported sources:
+Python 3.9+, standard library only. Nothing to install.
 
-| Tool | Storage read | Delete support |
+## Features
+
+- **One list** for all tools: tool badge, title, folder, created and updated times, message count.
+- **Full-text search** over messages and tool-call inputs (SQLite FTS5). All words must match, close matches rank first, and `"quoted text"` matches an exact phrase.
+- **Filters**: click a tool chip to show only that tool, ⌘-click to combine tools. Folder dropdown, sort order, starred only.
+- **Transcript view** with its own search (`Cmd+F`, `Enter` / `⇧Enter` to jump). Tool calls show as collapsible blocks with input and output.
+- **Star**, **hide**, **export** as Markdown, **copy** as Markdown, **reveal** the folder in Finder.
+- **Resume**: copies a shell command that reopens the conversation in its own CLI, in its folder.
+- **Bulk select**: click rows, `Shift`-click a range, then hide or delete them all at once.
+  `Cmd`-click a row outside select mode to start with that row.
+- **Delete** with a two-click confirm. Files go to the macOS Trash, so you can restore them.
+- **Activity chart** of the last 35 days (it follows the tool chips, not the search), a **Recent** menu with the last 8 opened conversations, light and dark theme.
+- **Keyboard**: `/` search, `j`/`k` or ↑/↓ to move, `Enter` to open, `Esc` to close.
+- **Auto-reindex** every 5 minutes while it runs, or `⟳ Reindex` on demand. The list refreshes itself when idle.
+
+## Supported tools
+
+Missing tools are skipped, so it works with any subset.
+
+| Tool | Reads from | Delete |
 |---|---|---|
-| Claude Code | `~/.claude/projects` plus any `~/.claude-*` profile dir, each with its `archived_projects` (JSONL) | ✓ move to Trash |
-| Codex CLI | `~/.codex/sessions`, `~/.codex/archived_sessions` (JSONL, current and 2025 rollout formats) | ✓ move to Trash |
-| Grok CLI | `~/.grok/sessions` (JSON/JSONL) | ✓ move to Trash |
-| OpenCode | `~/.local/share/opencode/opencode.db` (SQLite) | ✓ via `opencode session delete` |
-| Hermes | `~/.hermes/sessions/*.json` + `~/.hermes/state.db` | ✓ files via Trash (plus their DB twin via `hermes sessions delete`), db-only via `hermes sessions delete` |
-| Cursor IDE | `~/Library/Application Support/Cursor/.../state.vscdb` (SQLite) | read-only → hide |
-| Cursor CLI | `~/.cursor/chats` (SQLite per chat) | ✓ move to Trash |
+| Claude Code | `~/.claude/projects` and every `~/.claude-*` profile, with `archived_projects` | Trash |
+| Codex CLI | `~/.codex/sessions`, `~/.codex/archived_sessions` | Trash |
+| Grok CLI | `~/.grok/sessions` | Trash |
+| OpenCode | `~/.local/share/opencode/opencode.db` | `opencode session delete` |
+| Hermes | `~/.hermes/sessions/*.json`, `~/.hermes/state.db` | Trash for files, `hermes sessions delete` for DB rows |
+| Cursor IDE | `~/Library/Application Support/Cursor/.../state.vscdb` | read-only, hide only |
+| Cursor CLI | `~/.cursor/chats` | Trash |
+| Pi | `~/.pi/agent/sessions` (or `$PI_CODING_AGENT_DIR/sessions`) | Trash |
 
-Missing tools are skipped silently, so it runs fine on machines that only have some of them.
+Resume works for Claude Code, Codex, Grok, OpenCode, Hermes and Cursor CLI.
 
-## Run
+## Quick start
 
 ```bash
-python3 app.py            # index new/changed sessions, serve http://localhost:8377, open browser
-python3 app.py --full     # force a full reindex first
-python3 app.py --scan all # dry-run the scanners, print counts, no writes
-python3 app.py --port 9000 --no-browser
-python3 app.py --no-index # serve at once, skip the startup index
+git clone https://github.com/teddy0605/ai-conversation-browser.git
+cd ai-conversation-browser
+python3 app.py
 ```
 
-Python 3.9+ with SQLite FTS5 (macOS system Python has it), stdlib only — nothing to install. The first index takes about a minute on
-a large history (2,800 conversations); later startups only reparse sessions that changed. If the port is already in use,
-it assumes the app is running and just opens the browser — so a shell alias like
+This indexes your sessions, serves http://localhost:8377 and opens the browser.
+The first index of a large history (about 2,800 conversations) takes about a minute.
+Later starts only reparse sessions that changed.
+
+```bash
+python3 app.py --full                   # rebuild the whole index first
+python3 app.py --scan all               # dry run: print counts per tool, write nothing
+python3 app.py --no-index               # serve at once, skip the startup index
+python3 app.py --port 9000 --no-browser
+```
+
+If the app already runs, a second launch tells it to reindex and opens the browser.
+So one alias works for "start" and "show it again":
 
 ```bash
 alias convos='python3 /path/to/ai-conversation-browser/app.py'
 ```
 
-works as both "launch" and "bring it up again". If an instance is already running,
-the second launch asks it to reindex before opening the browser.
-
-### Menu bar app (macOS)
+## Menu bar app (macOS)
 
 ```bash
-menubar/build.sh   # builds ~/Applications/Convos.app and launches it
+menubar/build.sh
 ```
 
-A small Swift menu bar app to open, start, stop, restart and reindex the server
-without a terminal. It runs `app.py` from this folder through your login shell and
-appends output to `server.log`. It also detects and stops an instance you started
-from a terminal. Launching the menu bar app starts the server, and quitting it
-stops the server. Re-run `build.sh` if you move the repo.
+This builds `~/Applications/Convos.app` and starts it.
+From the menu bar you can open, start, stop, restart and reindex the server.
 
-It needs macOS 13+ and the Xcode Command Line Tools (`swiftc`). It always uses port
-8377 and ignores `ACB_PORT`.
+- It runs `app.py` from this folder through your login shell and writes output to `server.log`.
+- It finds and stops a server you started from a terminal.
+- Opening the app starts the server. Quitting the app stops it.
+- It needs macOS 13+ and the Xcode Command Line Tools (`swiftc`).
+- It always uses port 8377 and ignores `ACB_PORT`.
+- Run `build.sh` again if you move the repo.
 
-## Features
+## Configuration
 
-- **Unified list** with tool badge, title, workspace folder, created/updated times, message count
-- **Search**: instant fuzzy matching on titles/folders + SQLite FTS5 full-text search over
-  message content and tool-call inputs (commands, paths, queries). All words must match.
-  Close matches rank first, and `"quoted text"` matches the exact phrase. Snippets show
-  each matched word
-- **Filters**: click a tool chip to solo it (⌘-click to multi-toggle), folder dropdown, sorting,
-  ★ starred-only toggle
-- **Keyboard navigation**: `j`/`k` or ↑/↓ to move through the list, `Enter` to open
-- **Star/pin**: click the ★ on any card (or inside the transcript view) to pin a conversation;
-  the header button filters to starred-only
-- **Bulk select**: ☑ Select mode with big checkbox targets on every row — click a row to
-  toggle it, `Shift`-click to select a range, `Ctrl`/`Cmd`-click any row outside select mode
-  to turn select mode on with that row selected, "Select all shown" / "Clear" for the whole filtered list,
-  then hide or trash-delete the selection in one shot
-- **Activity heatmap**: a 35-day bar chart of conversation activity above the list. It follows
-  the tool chips and the show-hidden toggle, not the search, folder or starred filters
-- **Recently viewed**: 🕘 Recent dropdown remembers the last 8 conversations you opened
-- **Copy to clipboard**: copy the open conversation as Markdown without downloading a file
-- **Reveal in Finder**: jump straight to a conversation's working folder from the transcript view
-- **Resume**: copy a shell command that opens the conversation again in its own CLI, in its
-  working folder (Claude Code, Codex, Grok, OpenCode, Hermes, Cursor CLI)
-- **Transcript view** with its own in-conversation search (`Cmd+F` inside the panel,
-  `Enter`/`⇧Enter` to jump between matches). Tool calls from every source show as
-  collapsed blocks with their input and output
-- **Delete**: two-click confirm. File-based sources move the session file/folder to the
-  macOS Trash — recoverable, never a hard delete. OpenCode and Hermes DB-only sessions
-  delete via their own CLI (`opencode session delete`, `hermes sessions delete`). Deleting a
-  Hermes file copy also deletes its `state.db` twin with `hermes sessions delete`. Restoring
-  the file from the Trash does not bring that DB row back
-- **Hide**: removes a conversation from the app without touching the original. Works for
-  every source; for Cursor IDE it is the only option, because its chat storage has no safe
-  delete path. The 🙈 header button shows/unhides them
-- **Export**: download any conversation as a Markdown file
-- **Light/dark theme**: follows the OS, 🌓 button to override (persisted)
-- `⟳ Reindex` picks up new sessions without restarting; `/` focuses search; `Esc` closes
-- **Auto-reindex**: rescans sources every 5 minutes while running (`ACB_REINDEX_MIN` env
-  var to change, `0` to disable); the list refreshes itself when idle
-- **Full content indexed**: entire transcripts are searchable (per-conversation safety
-  bound of 2MB of text, `ACB_BODY_CAP` to change)
-- **Other env vars**: `ACB_PORT` (default 8377), `ACB_INDEX_DB` (default `index.db` next
-  to `app.py`)
+| Variable | Default | What it does |
+|---|---|---|
+| `ACB_PORT` | `8377` | HTTP port |
+| `ACB_INDEX_DB` | `index.db` next to `app.py` | Search index. It also holds your stars and hidden list. |
+| `ACB_REINDEX_MIN` | `5` | Minutes between automatic reindexes. `0` turns it off. |
+| `ACB_BODY_CAP` | `2000000` | Max characters of text indexed per conversation |
+| `PI_CODING_AGENT_DIR` | `~/.pi/agent` | Pi data folder |
 
-## Security
+`index.db` is safe to delete. The next run rebuilds it, but your stars and hidden list reset.
 
-- Binds to `127.0.0.1` only — never reachable from the network
-- Rejects requests with a non-localhost `Host` header (DNS-rebinding protection)
-- The app-owned databases (OpenCode, Hermes, Cursor IDE, Cursor CLI) are opened strictly
-  read-only (`mode=ro`) for indexing/search — this tool never writes to them directly.
-  Deleting an OpenCode or Hermes DB-only conversation instead shells out to that app's
-  own CLI (`opencode session delete` / `hermes sessions delete`), so writes only ever
-  happen through the owning app's own code, never through a raw connection of ours
-- No external assets, no CDN, no telemetry — everything stays on your machine
+## Privacy and security
 
-## Files
+- Everything stays on your machine. No CDN, no external assets, no telemetry.
+- The server binds to `127.0.0.1` and rejects requests with a non-localhost `Host` header.
+- The databases of OpenCode, Hermes, Cursor IDE and Cursor CLI open read-only (`mode=ro`).
+  To delete OpenCode or Hermes DB sessions, the app calls that tool's own CLI.
 
-- `app.py` — scanners for all sources, incremental indexer, HTTP API, delete/hide logic
-- `index.html` — the whole UI (vanilla JS, self-contained)
-- `index.db` — generated search index (gitignored; safe to delete, rebuilt on next run).
-  It also holds your stars and hidden list, so deleting it resets them
-- `menubar/` — Convos menu bar app (`Convos.swift`, `build.sh`)
-- `server.log` — server output when started from the menu bar app (gitignored)
+## Good to know
 
-## Notes
+- The first Finder delete can show a one-time macOS Automation prompt.
+  If you deny it, files move to `~/.Trash` directly, without "Put Back".
+- Deleting a Hermes file also deletes its `state.db` row. Restoring the file from the Trash does not restore that row.
+- A resumed Codex or Hermes session writes several files. Each file shows as its own entry.
+- Tool outputs are not indexed, only tool inputs.
+- Cursor IDE search uses Cursor's own `conversation-search.db`, so its tool calls are not searchable.
+- After a parser change, run `python3 app.py --full` to reparse old sessions.
+- macOS-only parts: Trash, Reveal folder and the Cursor IDE path. Linux would mostly need other source paths.
 
-- macOS-specific bits: Trash integration, Reveal folder (uses `open`) and the Cursor IDE
-  path. Everything else is portable; Linux support would mainly mean adjusting source paths.
-- The first Finder-based delete may trigger a one-time macOS Automation permission prompt.
-  If denied, files are moved to `~/.Trash` directly (works, but no "Put Back" in Finder).
-- Resumed Codex/Hermes sessions produce multiple files per logical session; each file is
-  listed separately so nothing is hidden from search.
-- Cursor IDE content search reuses Cursor's own `conversation-search.db` index; transcripts
-  are read lazily from `state.vscdb` with range queries (never a full scan of the 2GB db).
-  So Cursor IDE tool calls show in the transcript but are not searchable.
-- Tool outputs are not indexed (too large and noisy). Only tool inputs are searchable.
-- Parser changes need a full reindex (`python3 app.py --full`) to reach old sessions.
+## More screenshots
+
+All screenshots use invented data from [`docs/demo_data.py`](docs/demo_data.py).
+
+| | |
+|---|---|
+| ![Conversation list](docs/list.png) | ![Search with highlighted hits](docs/search.png) |
+| List with stars and activity chart | Search with highlighted snippets |
+| ![Search inside a conversation](docs/conversation-search.png) | ![Tool and folder filters](docs/filters.png) |
+| The list search carries into the transcript | Two tools and one folder selected |
+| ![Bulk select](docs/select.png) | ![Recent menu](docs/recent.png) |
+| Bulk select with hide and delete | Recently opened conversations |
+
+![Dark theme](docs/dark.png)
+
+To try the app on fake data, build a fake home folder and point the server at it:
+
+```bash
+python3 docs/demo_data.py /tmp/acb-demo
+HOME=/tmp/acb-demo ACB_INDEX_DB=/tmp/acb-demo/index.db ACB_PORT=8399 python3 app.py
+```
 
 ## Development
 
-Tests use only the standard library, temp dirs and mocked subprocess calls. They never read
-your real conversations or `index.db`.
+Tests use only the standard library, temp folders and mocked subprocess calls.
+They never read your real conversations or `index.db`.
 
 ```bash
 python3 -m unittest discover tests
 ```
 
-See `CONTRIBUTING.md`.
+Files:
 
-## License
+- `app.py`: scanners, incremental indexer, HTTP API, delete and hide logic
+- `index.html`: the whole UI, plain JavaScript
+- `menubar/`: the Convos menu bar app (`Convos.swift`, `build.sh`)
 
-MIT
+See [CONTRIBUTING.md](CONTRIBUTING.md). License: [MIT](LICENSE).
