@@ -10,4 +10,6 @@ __pycache__/
 
 # local-only
 .omo/
+.claude/
+.hermes/
 CLAUDE.md

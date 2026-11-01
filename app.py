@@ -13,6 +13,7 @@ Hermes DB-only sessions delete via their own CLI (`opencode session delete`,
 """
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -48,12 +49,19 @@ def log(msg, err=False):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, file=sys.stderr if err else sys.stdout)
 
 
-CLAUDE_ROOTS = [
-    os.path.join(HOME, ".claude", "projects"),
-    os.path.join(HOME, ".claude-j", "projects"),
-    os.path.join(HOME, ".claude-work", "projects"),
+def claude_roots(home):
+    """projects/ and archived_projects/ of every ~/.claude* profile dir that has projects/."""
+    roots = []
+    for d in sorted(glob.glob(os.path.join(home, ".claude*"))):
+        if os.path.isdir(os.path.join(d, "projects")):
+            roots += [os.path.join(d, "projects"), os.path.join(d, "archived_projects")]
+    return roots
+
+
+CODEX_SESSION_ROOTS = [
+    os.path.join(HOME, ".codex", "sessions"),
+    os.path.join(HOME, ".codex", "archived_sessions"),
 ]
-CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
 CODEX_TITLE_INDEX = os.path.join(HOME, ".codex", "session_index.jsonl")
 GROK_SESSIONS = os.path.join(HOME, ".grok", "sessions")
 OPENCODE_DB = os.path.join(HOME, ".local", "share", "opencode", "opencode.db")
@@ -292,7 +300,7 @@ def openai_tool_calls(tool_calls):
 
 def list_claude_units():
     units = {}
-    for root in CLAUDE_ROOTS:
+    for root in claude_roots(HOME):  # at enumeration time, so Reindex sees new profiles
         if not os.path.isdir(root):
             continue
         for proj in os.scandir(root):
@@ -401,8 +409,8 @@ def list_codex_units():
     global _codex_titles
     _codex_titles = load_codex_titles()
     units = {}
-    if os.path.isdir(CODEX_SESSIONS):
-        for dirpath, _dirs, files in os.walk(CODEX_SESSIONS):
+    for root in CODEX_SESSION_ROOTS:
+        for dirpath, _dirs, files in os.walk(root):
             for name in files:
                 if name.startswith("rollout-") and name.endswith(".jsonl"):
                     path = os.path.join(dirpath, name)
@@ -566,6 +574,7 @@ def parse_grok_unit(sess_dir, _args):
     size = sum(
         f.stat().st_size for f in os.scandir(sess_dir) if f.is_file()
     )
+    msg_count = summary.get("num_chat_messages")
     return {
         "id": sid,
         "title": summary.get("generated_title")
@@ -575,7 +584,7 @@ def parse_grok_unit(sess_dir, _args):
         "cwd": info.get("cwd"),
         "created_at": norm_iso(summary.get("created_at")),
         "updated_at": norm_iso(summary.get("updated_at") or summary.get("last_active_at")),
-        "msg_count": summary.get("num_chat_messages"),
+        "msg_count": msg_count if isinstance(msg_count, int) else None,
         "size_bytes": size,
         "origin_path": sess_dir,
         "deletable": 1,
@@ -712,13 +721,15 @@ def list_hermes_units():
     if os.path.isfile(HERMES_DB):
         rows = ro_query(
             HERMES_DB,
-            "SELECT id, title, cwd, started_at, ended_at, message_count FROM sessions",
+            "SELECT id, title, cwd, started_at, ended_at, message_count, "
+            "(SELECT COUNT(*) || ':' || COALESCE(MAX(timestamp), '') FROM messages m "
+            "WHERE m.session_id=sessions.id) FROM sessions",
         )
         for r in rows:
             # dedup: prefer the trashable flat-file copy when both exist
             if str(r[0]) in file_ids:
                 continue
-            units["db:" + str(r[0])] = (f"{r[3]}:{r[4]}", r)
+            units["db:" + str(r[0])] = (f"{r[3]}:{r[4]}:{r[5]}:{r[6]}:{r[1]}", r)
     return units
 
 
@@ -757,8 +768,9 @@ def parse_hermes_unit(unit_key, args):
             "deletable": 1,
             "body": body.text(),
             "tool_text": body.tool_text(),
+            "resume_id": str(obj.get("session_id") or sid),
         }
-    sid, title, cwd, started, ended, msg_count = args
+    sid, title, cwd, started, ended, msg_count = args[:6]
     body = BodyAcc()
     first_user = None
     rows = ro_query(
@@ -984,8 +996,12 @@ def list_cursor_cli_units():
                 if not chat.is_dir():
                     continue
                 db = os.path.join(chat.path, "store.db")
-                if os.path.isfile(db):
-                    units[chat.path] = (file_watermark(db), None)
+                if not os.path.isfile(db):
+                    continue
+                wm = file_watermark(db)
+                if os.path.isfile(db + "-wal"):  # recent writes live here until checkpoint
+                    wm += ":" + file_watermark(db + "-wal")
+                units[chat.path] = (wm, None)
     return units
 
 
@@ -1101,7 +1117,7 @@ _reindex_lock = threading.Lock()
 
 
 def index_con():
-    con = sqlite3.connect(INDEX_DB)
+    con = sqlite3.connect(INDEX_DB, timeout=60)
     con.row_factory = sqlite3.Row
     return con
 
@@ -1115,9 +1131,13 @@ def init_db():
             source TEXT NOT NULL, id TEXT NOT NULL, unit_key TEXT NOT NULL,
             title TEXT, cwd TEXT, created_at TEXT, updated_at TEXT,
             msg_count INTEGER, size_bytes INTEGER, origin_path TEXT NOT NULL,
-            deletable INTEGER NOT NULL, body TEXT,
+            deletable INTEGER NOT NULL, body TEXT, resume_id TEXT,
             PRIMARY KEY (source, id))"""
     )
+    if "resume_id" not in [r[1] for r in con.execute("PRAGMA table_info(conversations)")]:
+        con.execute("ALTER TABLE conversations ADD COLUMN resume_id TEXT")
+        # re-parse Hermes so file copies get their internal session id
+        con.execute("DELETE FROM indexed_units WHERE source='hermes'")
     con.execute(
         """CREATE TABLE IF NOT EXISTS indexed_units (
             source TEXT NOT NULL, unit_key TEXT NOT NULL, watermark TEXT NOT NULL,
@@ -1155,11 +1175,12 @@ def upsert(con, source, unit_key, watermark, rec):
         )
     con.execute(
         "INSERT INTO conversations (source,id,unit_key,title,cwd,created_at,updated_at,"
-        "msg_count,size_bytes,origin_path,deletable,body) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        "msg_count,size_bytes,origin_path,deletable,body,resume_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             source, rec["id"], unit_key, rec["title"], rec["cwd"], rec["created_at"],
             rec["updated_at"], rec["msg_count"], rec["size_bytes"], rec["origin_path"],
-            rec["deletable"], rec["body"],
+            rec["deletable"], rec["body"], rec.get("resume_id"),
         ),
     )
     if HAS_FTS:
@@ -1288,8 +1309,10 @@ def trash(path):
         raise FileNotFoundError(path)
     try:
         subprocess.run(
-            ["osascript", "-e",
-             f'tell application "Finder" to delete POSIX file "{path}"'],
+            ["osascript",
+             "-e", "on run argv",
+             "-e", 'tell application "Finder" to delete POSIX file (item 1 of argv)',
+             "-e", "end run", path],
             check=True, capture_output=True, timeout=15,
         )
         return "finder"
@@ -1358,6 +1381,17 @@ def delete_conversation(source, conv_id):
             con.close()
             return 400, {"error": str(e)}
     else:
+        # a Hermes file copy and its DB twin share the internal session id: delete both
+        twin = row["resume_id"] if source == "hermes" else None
+        if twin and os.path.isfile(HERMES_DB) and ro_query(
+            HERMES_DB, "SELECT 1 FROM sessions WHERE id=?", (twin,)
+        ):
+            try:
+                cli_delete_session(source, twin)
+            except RuntimeError as e:
+                con.close()
+                return 400, {"error": str(e)}
+            remove_unit(con, source, "db:" + twin)
         try:
             method = trash(origin)
         except FileNotFoundError:
@@ -1379,7 +1413,7 @@ def delete_conversation(source, conv_id):
 # ------------------------------------------------------------------ server ----
 
 LIST_COLS = ("source,id,title,cwd,created_at,updated_at,msg_count,size_bytes,"
-             "origin_path,deletable")
+             "origin_path,deletable,resume_id")
 
 
 FTS_COLS = "{title cwd body}"  # not source: "codex" must not match every Codex row
@@ -1480,10 +1514,10 @@ def search_index(q):
                 (match,),
             ).fetchall()
             if near:
-                close = set(con.execute(
+                close = {tuple(r) for r in con.execute(
                     "SELECT source, id FROM conversations_fts WHERE conversations_fts MATCH ?",
                     (near,),
-                ).fetchall())
+                ).fetchall()}
                 rows.sort(key=lambda r: (r[0], r[1]) not in close)  # stable: keeps bm25 order
             out = [{"source": r[0], "id": r[1], "snippet": make_snippet(r[2] or "", tokens, phrase)}
                    for r in rows]
@@ -1518,6 +1552,20 @@ class Handler(BaseHTTPRequestHandler):
         else:
             host = host.rsplit(":", 1)[0]
         return host in ALLOWED_HOSTS
+
+    def _post_ok(self):
+        """CSRF guard: only same-site JSON POSTs from a local origin."""
+        origin = self.headers.get("Origin")
+        if origin:
+            host = urlparse(origin).hostname or ""
+            if ":" in host:
+                host = f"[{host}]"
+            if host not in ALLOWED_HOSTS:
+                return False
+        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+            return False
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        return ctype == "application/json"
 
     def _json(self, obj, status=200):
         data = json.dumps(obj).encode("utf-8")
@@ -1596,7 +1644,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def do_POST(self):
-        if not self._host_ok():
+        if not self._host_ok() or not self._post_ok():
             self._json({"error": "forbidden"}, 403)
             return
         parsed = urlparse(self.path)

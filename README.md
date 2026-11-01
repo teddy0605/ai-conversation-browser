@@ -7,11 +7,11 @@ Supported sources:
 
 | Tool | Storage read | Delete support |
 |---|---|---|
-| Claude Code | `~/.claude/projects`, `~/.claude-j/projects`, `~/.claude-work/projects` (JSONL) | ✓ move to Trash |
-| Codex CLI | `~/.codex/sessions` (JSONL, current and 2025 rollout formats) | ✓ move to Trash |
+| Claude Code | `~/.claude/projects` plus any `~/.claude-*` profile dir, each with its `archived_projects` (JSONL) | ✓ move to Trash |
+| Codex CLI | `~/.codex/sessions`, `~/.codex/archived_sessions` (JSONL, current and 2025 rollout formats) | ✓ move to Trash |
 | Grok CLI | `~/.grok/sessions` (JSON/JSONL) | ✓ move to Trash |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite) | ✓ via `opencode session delete` |
-| Hermes | `~/.hermes/sessions/*.json` + `~/.hermes/state.db` | ✓ files via Trash, db-only via `hermes sessions delete` |
+| Hermes | `~/.hermes/sessions/*.json` + `~/.hermes/state.db` | ✓ files via Trash (plus their DB twin via `hermes sessions delete`), db-only via `hermes sessions delete` |
 | Cursor IDE | `~/Library/Application Support/Cursor/.../state.vscdb` (SQLite) | read-only → hide |
 | Cursor CLI | `~/.cursor/chats` (SQLite per chat) | ✓ move to Trash |
 
@@ -24,10 +24,11 @@ python3 app.py            # index new/changed sessions, serve http://localhost:8
 python3 app.py --full     # force a full reindex first
 python3 app.py --scan all # dry-run the scanners, print counts, no writes
 python3 app.py --port 9000 --no-browser
+python3 app.py --no-index # serve at once, skip the startup index
 ```
 
-Python 3.9+ stdlib only — nothing to install. The first index takes a few seconds;
-later startups only reparse sessions that changed. If the port is already in use,
+Python 3.9+ with SQLite FTS5 (macOS system Python has it), stdlib only — nothing to install. The first index takes about a minute on
+a large history (2,800 conversations); later startups only reparse sessions that changed. If the port is already in use,
 it assumes the app is running and just opens the browser — so a shell alias like
 
 ```bash
@@ -49,6 +50,9 @@ appends output to `server.log`. It also detects and stops an instance you starte
 from a terminal. Launching the menu bar app starts the server, and quitting it
 stops the server. Re-run `build.sh` if you move the repo.
 
+It needs macOS 13+ and the Xcode Command Line Tools (`swiftc`). It always uses port
+8377 and ignores `ACB_PORT`.
+
 ## Features
 
 - **Unified list** with tool badge, title, workspace folder, created/updated times, message count
@@ -62,23 +66,27 @@ stops the server. Re-run `build.sh` if you move the repo.
 - **Star/pin**: click the ★ on any card (or inside the transcript view) to pin a conversation;
   the header button filters to starred-only
 - **Bulk select**: ☑ Select mode with big checkbox targets on every row — click a row to
-  toggle it, `Shift`-click to select a range, `Ctrl`/`Cmd`-click any row (even outside select
-  mode) to jump straight into it, "Select all shown" / "Clear" for the whole filtered list,
+  toggle it, `Shift`-click to select a range, `Ctrl`/`Cmd`-click any row outside select mode
+  to turn select mode on with that row selected, "Select all shown" / "Clear" for the whole filtered list,
   then hide or trash-delete the selection in one shot
-- **Activity heatmap**: a 35-day bar chart of conversation activity above the list, respecting
-  active filters
+- **Activity heatmap**: a 35-day bar chart of conversation activity above the list. It follows
+  the tool chips and the show-hidden toggle, not the search, folder or starred filters
 - **Recently viewed**: 🕘 Recent dropdown remembers the last 8 conversations you opened
 - **Copy to clipboard**: copy the open conversation as Markdown without downloading a file
 - **Reveal in Finder**: jump straight to a conversation's working folder from the transcript view
+- **Resume**: copy a shell command that opens the conversation again in its own CLI, in its
+  working folder (Claude Code, Codex, Grok, OpenCode, Hermes, Cursor CLI)
 - **Transcript view** with its own in-conversation search (`Cmd+F` inside the panel,
   `Enter`/`⇧Enter` to jump between matches). Tool calls from every source show as
   collapsed blocks with their input and output
 - **Delete**: two-click confirm. File-based sources move the session file/folder to the
   macOS Trash — recoverable, never a hard delete. OpenCode and Hermes DB-only sessions
-  delete via their own CLI (`opencode session delete`, `hermes sessions delete`)
-- **Hide** (Cursor IDE only): removes a conversation from the app without touching the
-  original — Cursor IDE's chat storage has no safe delete path, so hide is the only option
-  there; the 🙈 header button shows/unhides them
+  delete via their own CLI (`opencode session delete`, `hermes sessions delete`). Deleting a
+  Hermes file copy also deletes its `state.db` twin with `hermes sessions delete`. Restoring
+  the file from the Trash does not bring that DB row back
+- **Hide**: removes a conversation from the app without touching the original. Works for
+  every source; for Cursor IDE it is the only option, because its chat storage has no safe
+  delete path. The 🙈 header button shows/unhides them
 - **Export**: download any conversation as a Markdown file
 - **Light/dark theme**: follows the OS, 🌓 button to override (persisted)
 - `⟳ Reindex` picks up new sessions without restarting; `/` focuses search; `Esc` closes
@@ -86,12 +94,14 @@ stops the server. Re-run `build.sh` if you move the repo.
   var to change, `0` to disable); the list refreshes itself when idle
 - **Full content indexed**: entire transcripts are searchable (per-conversation safety
   bound of 2MB of text, `ACB_BODY_CAP` to change)
+- **Other env vars**: `ACB_PORT` (default 8377), `ACB_INDEX_DB` (default `index.db` next
+  to `app.py`)
 
 ## Security
 
 - Binds to `127.0.0.1` only — never reachable from the network
 - Rejects requests with a non-localhost `Host` header (DNS-rebinding protection)
-- The three app-owned databases (OpenCode, Hermes, Cursor IDE) are opened strictly
+- The app-owned databases (OpenCode, Hermes, Cursor IDE, Cursor CLI) are opened strictly
   read-only (`mode=ro`) for indexing/search — this tool never writes to them directly.
   Deleting an OpenCode or Hermes DB-only conversation instead shells out to that app's
   own CLI (`opencode session delete` / `hermes sessions delete`), so writes only ever
@@ -102,12 +112,15 @@ stops the server. Re-run `build.sh` if you move the repo.
 
 - `app.py` — scanners for all sources, incremental indexer, HTTP API, delete/hide logic
 - `index.html` — the whole UI (vanilla JS, self-contained)
-- `index.db` — generated search index (gitignored; safe to delete, rebuilt on next run)
+- `index.db` — generated search index (gitignored; safe to delete, rebuilt on next run).
+  It also holds your stars and hidden list, so deleting it resets them
+- `menubar/` — Convos menu bar app (`Convos.swift`, `build.sh`)
+- `server.log` — server output when started from the menu bar app (gitignored)
 
 ## Notes
 
-- macOS-specific bits: Trash integration and the Cursor IDE path. Everything else is
-  portable; Linux support would mainly mean adjusting source paths.
+- macOS-specific bits: Trash integration, Reveal folder (uses `open`) and the Cursor IDE
+  path. Everything else is portable; Linux support would mainly mean adjusting source paths.
 - The first Finder-based delete may trigger a one-time macOS Automation permission prompt.
   If denied, files are moved to `~/.Trash` directly (works, but no "Put Back" in Finder).
 - Resumed Codex/Hermes sessions produce multiple files per logical session; each file is
@@ -117,6 +130,17 @@ stops the server. Re-run `build.sh` if you move the repo.
   So Cursor IDE tool calls show in the transcript but are not searchable.
 - Tool outputs are not indexed (too large and noisy). Only tool inputs are searchable.
 - Parser changes need a full reindex (`python3 app.py --full`) to reach old sessions.
+
+## Development
+
+Tests use only the standard library, temp dirs and mocked subprocess calls. They never read
+your real conversations or `index.db`.
+
+```bash
+python3 -m unittest discover tests
+```
+
+See `CONTRIBUTING.md`.
 
 ## License
 

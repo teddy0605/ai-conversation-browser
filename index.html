@@ -382,7 +382,7 @@ function render() {
       <span class="right" title="${esc(absTime(c.updated_at))}">
         <span class="starToggle${c.starred ? " on" : ""}" data-k="${esc(key(c))}" title="Star this conversation">★</span>
         ${relTime(c.updated_at)}
-        <span class="msgs">${c.msg_count ?? "?"} msgs</span>
+        <span class="msgs">${esc(String(c.msg_count ?? "?"))} msgs</span>
       </span>
       <span class="meta"><span class="cwd">${hlTokens(shortCwd(c.cwd), hlRe) || "(no folder)"}</span>
         · created ${esc(absTime(c.created_at))}</span>
@@ -470,10 +470,10 @@ async function loadList() {
 
 function scheduleFts() {
   clearTimeout(ftsTimer);
+  const seq = ++ftsSeq;                       // any older in-flight response is now stale
   const q = $("q").value.trim();
   if (q.length < 2) { ftsMatches = null; render(); return; }
   ftsTimer = setTimeout(async () => {
-    const seq = ++ftsSeq;
     try {
       const r = await fetch("/api/search?q=" + encodeURIComponent(q));
       const { matches } = await r.json();
@@ -511,7 +511,7 @@ function buildPHead(c) {
     </div>
     <div class="sub">${esc(c.cwd || "(no folder)")}<br>
       created ${esc(absTime(c.created_at))} · updated ${esc(absTime(c.updated_at))}
-      · ${c.msg_count ?? "?"} msgs<br>
+      · ${esc(String(c.msg_count ?? "?"))} msgs<br>
       <span style="opacity:.7">${esc(c.origin_path)}</span></div>
     <div class="actions">
       ${c.deletable
@@ -522,6 +522,7 @@ function buildPHead(c) {
       <button onclick="exportCurrent()" title="Download this conversation as a Markdown file">⬇ Export .md</button>
       <button onclick="copyCurrent(this)" title="Copy this conversation as Markdown">📋 Copy</button>
       ${c.cwd ? `<button onclick="revealCurrent()" title="Open this conversation's folder in Finder">📂 Reveal folder</button>` : ""}
+      ${resumeCommand(c) ? `<button onclick="copyResume(this)" title="Copy a command that reopens this conversation in its CLI">▶ Copy resume command</button>` : ""}
     </div>`;
 }
 
@@ -551,6 +552,7 @@ function setSplit(on) {
 
 async function openDetail(c) {
   current = c;
+  currentMsgs = [];
   $("overlay").classList.add("open");
   if (innerWidth >= SPLIT_MIN_WIDTH) setSplit(true);
   else document.body.style.overflow = "hidden";
@@ -595,6 +597,8 @@ async function openDetail(c) {
       if (psMarks.length) { $("ps").focus(); $("ps").select(); }
     }
   } catch (e) {
+    if (current !== c) return;
+    currentMsgs = [];
     $("pbody").innerHTML = `<div id="loading">Failed to load: ${esc(e.message)}</div>`;
   }
 }
@@ -730,16 +734,60 @@ async function copyCurrent(btn) {
   setTimeout(() => { btn.textContent = orig; }, 1500);
 }
 
+const shq = s => "'" + s.replace(/'/g, "'\\''") + "'";
+
+// Shell command that reopens the conversation in its own CLI, or "" when the source has none.
+function resumeCommand(c) {
+  let cmd = "";
+  if (c.source === "claude-code") {
+    // Sessions from another Claude profile only resume with that profile's config dir.
+    const m = c.origin_path.match(/^(.*)\/(?:archived_)?projects\/[^/]+\/[^/]+\.jsonl$/);
+    const env = m && !m[1].endsWith("/.claude") ? `CLAUDE_CONFIG_DIR=${shq(m[1])} ` : "";
+    cmd = `${env}claude --resume ${shq(c.id)}`;
+  } else if (c.source === "codex") {
+    const m = c.id.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    if (m) cmd = `codex resume ${shq(m[0])}`;
+  } else if (c.source === "grok") cmd = `grok --resume ${shq(c.id)}`;
+  else if (c.source === "opencode") cmd = `opencode --session ${shq(c.id)}`;
+  else if (c.source === "hermes") cmd = `hermes --resume ${shq(c.resume_id || c.id)}`;
+  else if (c.source === "cursor-cli") cmd = `cursor-agent --resume ${shq(c.id)}`;
+  if (!cmd) return "";
+  return c.cwd ? `cd ${shq(c.cwd)} && ${cmd}` : cmd;
+}
+
+async function copyResume(btn) {
+  if (!current) return;
+  await navigator.clipboard.writeText(resumeCommand(current));
+  const orig = btn.textContent;
+  btn.textContent = "✅ Copied!";
+  setTimeout(() => { btn.textContent = orig; }, 1500);
+}
+
+// POST JSON; true when the server accepted it.
+async function postOk(url, body) {
+  try {
+    const r = await fetch(url, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return r.ok;
+  } catch (e) { return false; }
+}
+
 async function toggleStarCurrent() {
   const c = current;
-  if (!c) return;
+  if (!c || c.starPending) return;             // one star request per row at a time
   c.starred = c.starred ? 0 : 1;
   $("phead").innerHTML = buildPHead(c);
   buildChips();
-  await fetch("/api/star", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ source: c.source, id: c.id, starred: !!c.starred }),
-  });
+  c.starPending = true;
+  const ok = await postOk("/api/star", { source: c.source, id: c.id, starred: !!c.starred });
+  c.starPending = false;
+  if (ok) return;
+  c.starred = c.starred ? 0 : 1;
+  if (current === c) $("phead").innerHTML = buildPHead(c);
+  buildChips();
+  alert("Could not save the star");
 }
 
 async function revealCurrent() {
@@ -757,25 +805,29 @@ async function revealCurrent() {
 
 async function hideCurrent(hidden) {
   const c = current;
-  await fetch("/api/hide", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ source: c.source, id: c.id, hidden: !!hidden }),
-  });
+  if (!await postOk("/api/hide", { source: c.source, id: c.id, hidden: !!hidden })) {
+    alert("Could not save the hidden state");
+    return;
+  }
   c.hidden = hidden ? 1 : 0;
   closeDetail(); buildChips(); render();
 }
 
-function toggleStar(k, el) {
+async function toggleStar(k, el) {
   const c = all.find(x => key(x) === k);
-  if (!c) return;
+  if (!c || c.starPending) return;             // one star request per row at a time
   c.starred = c.starred ? 0 : 1;
   el.classList.toggle("on", !!c.starred);
   buildChips();
   if (showStarredOnly && !c.starred) render();
-  fetch("/api/star", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ source: c.source, id: c.id, starred: !!c.starred }),
-  });
+  c.starPending = true;
+  const ok = await postOk("/api/star", { source: c.source, id: c.id, starred: !!c.starred });
+  c.starPending = false;
+  if (ok) return;
+  c.starred = c.starred ? 0 : 1;
+  el.classList.toggle("on", !!c.starred);
+  buildChips(); render();
+  alert("Could not save the star");
 }
 
 function toggleBulkMode() {
@@ -800,6 +852,7 @@ function exitBulkMode() {
 }
 
 function updateBulkBar() {
+  disarmBulkDelete();                         // selection or mode changed: ask again
   const n = bulkSelected.size;
   $("bulkBar").style.display = bulkMode ? "flex" : "none";
   $("bulkCount").textContent = `${n} selected`;
@@ -889,15 +942,21 @@ $("bulkNoneBtn").addEventListener("click", clearSelection);
 $("bulkHideBtn").addEventListener("click", async () => {
   const items = [...bulkSelected.values()];
   if (!items.length) return;
-  await fetch("/api/bulk-hide", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ items, hidden: true }),
-  });
+  if (!await postOk("/api/bulk-hide", { items, hidden: true })) {
+    alert("Could not hide the selected conversations");
+    return;
+  }
   for (const c of all) if (bulkSelected.has(key(c))) c.hidden = 1;
   exitBulkMode();
 });
 let bulkDeleteConfirm = false;
 let bulkDeleteTimer = null;
+function disarmBulkDelete() {
+  if (!bulkDeleteConfirm) return;
+  clearTimeout(bulkDeleteTimer);
+  bulkDeleteConfirm = false;
+  $("bulkDeleteBtn").textContent = "🗑 Delete selected";
+}
 $("bulkDeleteBtn").addEventListener("click", async () => {
   const items = [...bulkSelected.values()].filter(it => {
     const c = all.find(x => x.source === it.source && x.id === it.id);
