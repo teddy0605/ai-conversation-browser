@@ -285,7 +285,7 @@ const home = "/Users/";
 
 function shortCwd(cwd) {
   if (!cwd) return "";
-  const m = cwd.match(/^\/Users\/[^/]+(\/.*)?$/);
+  const m = cwd.match(/^\/(?:Users|home)\/[^/]+(\/.*)?$/);
   return m ? "~" + (m[1] || "") : cwd;
 }
 function relTime(iso) {

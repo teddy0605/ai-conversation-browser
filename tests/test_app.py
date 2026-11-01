@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 _HOME = tempfile.TemporaryDirectory(prefix="acb-test-home-")
 os.environ["HOME"] = _HOME.name
@@ -372,6 +372,100 @@ class ClaudeRootsTest(Base):
             os.makedirs(os.path.join(home, ".claude-new", "projects", "p"))
             open(os.path.join(home, ".claude-new", "projects", "p", "s.jsonl"), "w").close()
             self.assertEqual(len(app.list_claude_units()), 1)
+
+
+# 15. I1: removing one of two same-name Codex rollouts keeps the other listed
+class CodexDuplicateTest(Base):
+    def test_surviving_copy_reindexed(self):
+        roots = [os.path.join(self.tmp, "sessions"), os.path.join(self.tmp, "archived_sessions")]
+        p = patch.object(app, "CODEX_SESSION_ROOTS", roots)
+        p.start()
+        self.addCleanup(p.stop)
+        name = "rollout-2026-01-01T00-00-00-0000.jsonl"
+        paths = []
+        for root in roots:
+            os.makedirs(root)
+            paths.append(os.path.join(root, name))
+            with open(paths[-1], "w") as fh:
+                fh.write(json.dumps({"type": "session_meta", "payload": {"id": "s", "cwd": self.tmp}}) + "\n")
+        app.reindex(only="codex")
+        self.assertEqual(len(self.records("codex")), 1)
+        owner = self.records("codex")[0]["origin_path"]
+        os.remove(owner)
+        app.reindex(only="codex")
+        survivor = [p for p in paths if p != owner][0]
+        self.assertEqual([r["origin_path"] for r in self.records("codex")], [survivor])
+
+    def test_survivor_retried_after_failed_reparse(self):
+        roots = [os.path.join(self.tmp, "sessions"), os.path.join(self.tmp, "archived_sessions")]
+        p = patch.object(app, "CODEX_SESSION_ROOTS", roots)
+        p.start()
+        self.addCleanup(p.stop)
+        for root in roots:
+            os.makedirs(root)
+            with open(os.path.join(root, "rollout-copy.jsonl"), "w") as fh:
+                fh.write(json.dumps({"type": "session_meta", "payload": {"id": "s", "cwd": self.tmp}}) + "\n")
+        app.reindex(only="codex")
+        os.remove(self.records("codex")[0]["origin_path"])
+        fail = PermissionError("temporary failure")
+        with patch.dict(app.SOURCES, {"codex": (app.list_codex_units, Mock(side_effect=fail))}):
+            self.assertEqual(app.reindex(only="codex")["codex"]["errors"], 1)
+        app.reindex(only="codex")
+        self.assertEqual(len(self.records("codex")), 1)
+
+
+# 16. Reveal shows a bundle cwd in Finder instead of launching it
+class RevealTest(Base):
+    def reveal(self, cwd):
+        self.add_record("codex", "c", "/x", cwd=cwd)
+        raw = json.dumps({"source": "codex", "id": "c"}).encode()
+        head = ("POST /api/reveal HTTP/1.1\r\nHost: localhost:8377\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(raw)}\r\n"
+                "Connection: close\r\n\r\n")
+        with patch.object(app.subprocess, "run") as run:
+            app.Handler(_Conn(head.encode() + raw), ("127.0.0.1", 1), None)
+        return run.call_args.args[0]
+
+    def test_bundle_revealed_folder_opened(self):
+        bundle = os.path.join(self.tmp, "Evil.app")
+        os.makedirs(os.path.join(bundle, "Contents", "MacOS"))
+        folder = os.path.join(self.tmp, "project")
+        os.makedirs(folder)
+        self.assertEqual(self.reveal(bundle), ["open", "-R", bundle])
+        self.assertEqual(self.reveal(folder), ["open", folder])
+
+
+# 17. L1: an in-place Hermes message edit changes the watermark
+class HermesEditTest(Base):
+    def test_edit_reindexed(self):
+        con = self.make_hermes_db()
+        self.addCleanup(con.close)
+        con.execute("INSERT INTO sessions VALUES ('s1', 'T', ?, 1, NULL, 1)", (self.tmp,))
+        con.execute("INSERT INTO messages VALUES ('s1', 'user', 'old text', NULL, NULL, 1)")
+        con.commit()
+        app.reindex(only="hermes")
+        con.execute("UPDATE messages SET content='edited text'")
+        con.commit()
+        app.reindex(only="hermes")
+        self.assertIn("edited text", self.records("hermes")[0]["body"])
+
+
+# 18. A WAL db closed cleanly (no -wal or -shm file) still opens read-only
+class CleanWalTest(Base):
+    def test_read_without_wal_files(self):
+        db = os.path.join(self.tmp, "store.db")
+        con = sqlite3.connect(db)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("CREATE TABLE t (x)")
+        con.execute("INSERT INTO t VALUES (1)")
+        con.commit()
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.close()
+        for suffix in ("-wal", "-shm"):  # Cursor's sqlite deletes them on close
+            if os.path.exists(db + suffix):
+                os.remove(db + suffix)
+        self.assertEqual(app.ro_query(db, "SELECT x FROM t"), [(1,)])
+        self.assertFalse(os.path.exists(db + "-wal") or os.path.exists(db + "-shm"))
 
 
 if __name__ == "__main__":

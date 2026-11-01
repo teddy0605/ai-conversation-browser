@@ -158,11 +158,23 @@ def prefix_range(prefix):
 
 def ro_query(db_path, sql, params=()):
     """Read-only query against a live (possibly WAL) sqlite db, with busy retry.
-    Never uses immutable=1 — these dbs may be written by their apps concurrently."""
+    Uses immutable=1 only for a WAL db without a -wal file: these dbs may be
+    written by their apps concurrently."""
     last_err = None
+    uri = f"file:{db_path}?mode=ro"
+    # A WAL db closed cleanly has no -wal or -shm file, so no writer has it open.
+    # A read-only open then fails on Apple's SQLite and creates both files on
+    # upstream SQLite. immutable=1 reads the db file alone on both.
+    try:
+        with open(db_path, "rb") as fh:
+            clean_wal = fh.read(20)[18:19] == b"\x02"  # header byte 18: 2 = WAL
+    except OSError:
+        clean_wal = False
+    if clean_wal and not os.path.exists(db_path + "-wal"):
+        uri += "&immutable=1"
     for _ in range(5):
         try:
-            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            con = sqlite3.connect(uri, uri=True)
             try:
                 return con.execute(sql, params).fetchall()
             finally:
@@ -722,7 +734,8 @@ def list_hermes_units():
         rows = ro_query(
             HERMES_DB,
             "SELECT id, title, cwd, started_at, ended_at, message_count, "
-            "(SELECT COUNT(*) || ':' || COALESCE(MAX(timestamp), '') FROM messages m "
+            "(SELECT COUNT(*) || ':' || COALESCE(MAX(timestamp), '') || ':' || "
+            "COALESCE(SUM(LENGTH(content)), '') FROM messages m "
             "WHERE m.session_id=sessions.id) FROM sessions",
         )
         for r in rows:
@@ -1231,6 +1244,20 @@ def reindex(full=False, only=None):
                     (source,),
                 ).fetchall()
             )
+            removed = 0
+            for key in set(old) - set(units):
+                remove_unit(con, source, key)
+                removed += 1
+            if removed:
+                # Copies of one conversation id share one row. Drop the watermark
+                # of every copy whose row a removal just deleted, so it is reparsed
+                # now and again on later passes until a parse succeeds.
+                con.execute(
+                    "DELETE FROM indexed_units WHERE source=? AND unit_key NOT IN "
+                    "(SELECT unit_key FROM conversations WHERE source=?)", (source, source))
+                owned = {r[0] for r in con.execute(
+                    "SELECT unit_key FROM indexed_units WHERE source=?", (source,))}
+                old = {k: v for k, v in old.items() if k in owned}
             updated = errors = 0
             for key, (wm, args) in units.items():
                 if not full and old.get(key) == wm:
@@ -1244,10 +1271,6 @@ def reindex(full=False, only=None):
                 if rec:
                     upsert(con, source, key, wm, rec)
                     updated += 1
-            removed = 0
-            for key in set(old) - set(units):
-                remove_unit(con, source, key)
-                removed += 1
             con.commit()
             stats[source] = {
                 "total": len(units),
@@ -1713,7 +1736,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not os.path.isdir(row["cwd"]):
                     self._json({"error": "folder no longer exists"}, 400)
                     return
-                subprocess.run(["open", row["cwd"]], check=False)
+                # Bundles (.app, .prefPane) keep their files in Contents/ and `open`
+                # launches them. Show those in Finder instead.
+                bundle = os.path.isdir(os.path.join(row["cwd"], "Contents"))
+                subprocess.run(["open", "-R", row["cwd"]] if bundle else ["open", row["cwd"]],
+                               check=False)
                 self._json({"ok": True})
             elif parsed.path == "/api/bulk-hide":
                 items = body.get("items") or []

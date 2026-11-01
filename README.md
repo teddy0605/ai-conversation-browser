@@ -3,6 +3,10 @@
 One local web page to browse, search and clean up conversations from **all** the AI coding
 tools on your machine — because you remember *the conversation*, not *which tool* it was in.
 
+[![Tests](https://github.com/teddy0605/ai-conversation-browser/actions/workflows/test.yml/badge.svg)](https://github.com/teddy0605/ai-conversation-browser/actions/workflows/test.yml)
+
+![Conversation list with sample data](docs/screenshot.png)
+
 Supported sources:
 
 | Tool | Storage read | Delete support |
